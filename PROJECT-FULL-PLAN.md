@@ -28,9 +28,9 @@ Acceptance is recorded. The deterministic 500-trial synthetic-session acceptance
 
 ### Next: Milestone 3 — Dataset and representation
 
-**Current status (2026-07-26): in progress, first current-data preprocessing verified.** Migration 7 records snapshot-bound preprocessing runs and their immutable artifact/report paths. Dataset manifests are verified against streamed raw-file SHA-256 hashes before becoming ready. Split assignment uses the configured fractions rather than fixed defaults. Canonical forward/inverse transforms, valid-by-construction endpoint encoding, a NumPy least-squares clamped cubic spline with rank/condition diagnostics, and monotonic 12-interval timing representations are implemented as tested foundations. Collection protocol 2 is cursor-relative and stratified, timestamps trials only after `frameSwapped`, enforces token-bound timeouts, drains the native ring before finalization, and writes buffered Parquet row groups. The native Raw Input path is a preallocated ring with no per-event heap allocation and rejects unsupported absolute mouse packets. GitHub Actions runs the Python/QML suite and Windows native build.
+**Current status (2026-07-26): in progress; representation contract simplified before training.** Migration 7 records snapshot-bound preprocessing runs and their immutable artifact/report paths. Dataset manifests are verified against streamed raw-file SHA-256 hashes before becoming ready. Split assignment uses the configured fractions rather than fixed defaults. The training representation is now intentionally simple: fixed-count equal-time canonical positions plus total movement duration. The earlier spline/timing/endpoint representation remains only a tested exploratory implementation and is not a training contract. Collection protocol 2 is cursor-relative, timestamps trials only after `frameSwapped`, enforces token-bound timeouts, drains the native ring before finalization, and writes buffered Parquet row groups. The native Raw Input path is a preallocated ring with no per-event heap allocation and rejects unsupported absolute mouse packets. GitHub Actions runs the Python/QML suite and Windows native build.
 
-The initial real snapshot contains 40 retained valid-click trials from two completed sessions. It remains immutable but is legacy-protocol data, is non-independent for validation/test purposes, and must not establish reaction-time ground truth. A separate current-protocol snapshot of the completed 40-trial smoke session has now been preprocessed by the worker: all 40 trials were represented, none skipped, and its canonical spline reconstruction error was 0.0221 maximum / 0.0080 mean. The Dataset page launches preprocessing in a worker and shows the latest completed representation summary. This one-session snapshot is train-only by design and cannot support independent validation or model training. Training remains deferred until enough additional current-protocol sessions exist for independent held-out splits and the processed-artifact transform-parity checks are complete.
+The initial real snapshot contains 40 retained valid-click trials from two completed sessions. It remains immutable but is legacy-protocol data, is non-independent for validation/test purposes, and must not establish reaction-time ground truth. A separate current-protocol snapshot of the completed 40-trial smoke session was preprocessed successfully with the earlier exploratory spline representation; that artifact is retained for audit only and must not be used for training. The next preprocessing schema writes equal-time canonical position sequences and total movement duration instead. The Dataset page launches preprocessing in a worker and shows the latest completed representation summary. This one-session snapshot is train-only by design and cannot support independent validation or model training. Training remains deferred until enough additional current-protocol sessions exist for independent held-out splits and the new processed-artifact parity tests are complete.
 
 Milestone 2 was implemented as four testable slices:
 
@@ -401,7 +401,7 @@ Separate the application into four primary processes or libraries.
 
 │ flow integration                            │
 
-│ spline decoding                             │
+│ equal-time position decoding                │
 
 │ timed trajectory generation                 │
 
@@ -989,11 +989,19 @@ Randomization must be controlled and reproducible.
 
 
 
-Sample conditions from balanced distributions rather than unrestricted random screen positions.
+**Current collection sampler for training data.** Sample the target center continuously and uniformly over the feasible canvas, rather than from distance, direction, or region bins. Draw a radius first, then sample `r ~ Uniform(12, 36)` logical pixels, `center_x ~ Uniform(r + 12, canvas_width - r - 12)`, and `center_y ~ Uniform(r + 12, canvas_height - r - 12)`. The cursor remains where the participant left it. Persist the sampled radius and center, then calculate and persist realized start-to-target distance, direction, region, and difficulty after the target is presented. The sampler must be seeded and targets must remain fully inside the selected canvas.
 
 
 
-Condition axes:
+**Protocol transition.** The implemented protocol-2 scheduler is stratified and cursor-relative. The continuous sampler above defines the next collection protocol and must be implemented with a new protocol version before collecting additional data intended for this simplified training plan. Keep the existing protocol-2 snapshot separate rather than silently treating it as continuous-uniform data.
+
+
+
+**Revisit requirement.** This continuous screen-uniform sampler can under-sample edge-adjacent starts, very short/long movements, tiny/large targets, and unusual direction-radius combinations. Before relying on a trained model for those extreme input cases, inspect condition coverage and held-out error by bins. If coverage or quality is weak, introduce stratified or least-covered-cell sampling in a new collection-protocol version; do not silently relabel or mix older data.
+
+
+
+Historical condition axes (not the current training-data sampler):
 
 
 
@@ -1013,7 +1021,7 @@ Fitts-style difficulty band
 
 
 
-Suggested configurable default bins:
+Historical suggested bins (retained for a future stratified sampler, not active now):
 
 
 
@@ -1557,11 +1565,11 @@ Canonicalize geometry
 
 &#x20;   ↓
 
-Fit spatial B-spline
+Resample equal-time canonical positions
 
 &#x20;   ↓
 
-Fit monotonic timing representation
+Record total movement duration
 
 &#x20;   ↓
 
@@ -1637,6 +1645,10 @@ entry\_to\_click\_duration
 
 
 
+These onset, reaction, and entry measurements are retained for quality review only. They are not output targets in the current training representation.
+
+
+
 \---
 
 
@@ -1703,11 +1715,47 @@ The transform must have exact forward and inverse implementations shared by prep
 
 
 
-\# 14. Spatial trajectory representation
+\# 14. Equal-time canonical position representation
 
 
 
-Use a clamped cubic B-spline.
+The v1 training target is a fixed-size sequence of canonical positions. It does not use spline controls, endpoint latents, reaction delay, click dwell, or a learned timing curve.
+
+
+
+For each valid trial, define the movement interval from detected movement onset to the valid click and resample it at equal fractions of elapsed movement time:
+
+
+
+```text
+
+position_count = 64
+
+t_i = i / (position_count - 1) * total_movement_duration
+
+y_i = canonical_position(t_i), for i = 0 ... 63
+
+```
+
+
+
+The first point is exactly `(0, 0)`. The final point is the recorded valid-click position in canonical coordinates. Interpolate the recorded screen-space samples linearly in time before applying the canonical transform. Store every `x,y` value in fixed order and store total movement duration separately. A model version must not vary `position_count` between samples.
+
+
+
+At generation time, decode the 64 positions directly, inverse-transform them into screen coordinates, and assign timestamps uniformly from zero through the generated total duration. If the final point falls outside the requested target circle, radially clip that final point to a small safety margin inside the circle, log the correction, and report its rate during validation.
+
+
+
+The spline material below is retained as historical exploratory work only. It is not part of preprocessing, training, inference, validation, or export for the current plan.
+
+
+
+\## Retired B-spline details (historical only)
+
+
+
+The following retired details are retained only to explain older exploratory artifacts. They impose no current implementation requirement.
 
 
 
@@ -1831,7 +1879,7 @@ Do not apply arbitrary post-generation Gaussian noise.
 
 
 
-\# 15. Timing representation
+\# 15. Retired spline and timing representation (historical only)
 
 
 
@@ -1925,7 +1973,7 @@ Use configurable lower and upper clamps only as runtime safety bounds, not as re
 
 
 
-\# 16. Endpoint representation
+\# 16. Retired endpoint representation (historical only)
 
 
 
@@ -2045,10 +2093,6 @@ previous cursor velocity x
 
 previous cursor velocity y
 
-
-
-click requested flag
-
 monitor DPI scale
 
 optional session/style embedding
@@ -2087,33 +2131,21 @@ Preserve both canonicalized geometry and screen-context features. This allows ge
 
 
 
-The initial CFM model output vector should contain:
+The initial learned-model output vector contains only the equal-time canonical positions and total movement duration:
 
 
 
 ```text
 
-14 intermediate 2D spline-control residuals = 28 values
+64 two-dimensional canonical positions     = 128 values
 
-12 timing logits                           = 12 values
-
-endpoint latent                            = 2 values
-
-log reaction time                          = 1 value
-
-log movement duration                      = 1 value
-
-log click dwell                            = 1 value
+log total movement duration                = 1 value
 
 \------------------------------------------------------
 
-Total                                      = 45 values
+Total                                      = 129 values
 
 ```
-
-
-
-If click is disabled, the click-dwell field may be generated but ignored.
 
 
 
@@ -2233,9 +2265,9 @@ Sample one of the nearest trials
 
 Optionally blend only highly compatible neighbors
 
-Transform its canonical spline parameters to the request
+Transform its equal-time canonical positions to the request
 
-Return its timing and endpoint parameters
+Return its total movement duration
 
 ```
 
@@ -2803,17 +2835,15 @@ Timestamps are monotonic
 
 Movement duration is positive
 
-Reaction time is nonnegative
-
 No NaN or infinity
 
 No point leaves configured virtual desktop unless explicitly permitted
 
-Spline decoding succeeds
+Exactly 64 canonical positions decode successfully
 
-Timing mapping is monotonic
+Generated timestamps are equally spaced from zero through total duration
 
-Click occurs only when requested
+Any final-point target-circle projection is logged and stays below a configured validation threshold
 
 ```
 
@@ -2829,11 +2859,7 @@ Compare real and generated held-out movements for:
 
 ```text
 
-Reaction-time distribution
-
 Movement-time distribution
-
-Entry-to-click distribution
 
 Endpoint distribution within target
 
@@ -3125,7 +3151,7 @@ MouseModel\_<name>\_<version>/
 
 ├─ output\_normalization.json
 
-├─ spline\_spec.json
+├─ position\_sequence\_spec.json
 
 ├─ runtime\_config.json
 
@@ -3163,13 +3189,9 @@ output feature order
 
 normalization values
 
-spline degree
+equal-time position count
 
-spline knot vector
-
-control count
-
-timing interval count
+position interpolation method
 
 default solver
 
@@ -3213,11 +3235,9 @@ ODE integration
 
 output denormalization
 
-endpoint disk transform
+equal-time position decoding
 
-timing softplus and normalization
-
-B-spline evaluation
+final-point target-circle safety projection
 
 canonical-to-screen transform
 
@@ -3425,15 +3445,15 @@ Denormalize generated parameter vector
 
 &#x20;   ↓
 
-Decode endpoint into target disk
+Decode equal-time canonical positions and total movement duration
 
 &#x20;   ↓
 
-Build spatial B-spline controls
+Inverse-transform canonical positions into screen coordinates
 
 &#x20;   ↓
 
-Build monotonic timing mapping
+Assign equal timestamps over total movement duration
 
 &#x20;   ↓
 
@@ -3453,7 +3473,7 @@ Apply final numeric corrections
 
 &#x20;   ↓
 
-Return timed samples and optional click timing
+Return timed samples; clicking remains outside the v1 model output
 
 ```
 
@@ -3471,7 +3491,7 @@ Force:
 
 First trajectory sample = requested start position
 
-Final trajectory sample = generated valid endpoint
+Final trajectory sample = generated final position, projected only if needed into the target circle
 
 Final endpoint remains inside circle with numeric safety margin
 
@@ -3479,7 +3499,7 @@ Final endpoint remains inside circle with numeric safety margin
 
 
 
-Do not modify intermediate points with an arbitrary endpoint correction after generation unless validation detects numeric drift.
+Do not modify intermediate points after generation. A final-point target-circle safety projection is permitted only when the generated point is outside the target; it must be recorded in generation metadata.
 
 
 
@@ -3487,7 +3507,7 @@ Do not modify intermediate points with an arbitrary endpoint correction after ge
 
 
 
-\# 32. Spline evaluation
+\# 32. Equal-time position evaluation
 
 
 
@@ -3497,7 +3517,7 @@ The generator must evaluate:
 
 ```text
 
-position(t) = spline(progress(t))
+position(t) = piecewise_linear(equal_time_positions, t / movement_duration)
 
 ```
 
@@ -3555,7 +3575,7 @@ custom
 
 
 
-Use double precision for spline and timing evaluation in the C++ runtime.
+Use double precision for position interpolation and coordinate transforms in the C++ runtime.
 
 
 
@@ -3857,7 +3877,7 @@ Split summary
 
 Condition-space heatmap
 
-Spline reconstruction report
+Equal-time resampling report
 
 Preprocessing warnings
 
@@ -3907,7 +3927,7 @@ Training settings
 
 Condition features
 
-Spline representation
+Position-sequence representation
 
 Timing representation
 
@@ -4121,9 +4141,7 @@ Start
 
 Target circle
 
-Generated endpoint
-
-Spline control polygon toggle
+Generated final point
 
 Trajectory
 
@@ -4141,11 +4159,7 @@ Show generated metadata:
 
 ```text
 
-Reaction delay
-
 Movement duration
-
-Click delay
 
 Path length
 
@@ -4359,7 +4373,7 @@ Click markers
 
 Target-entry markers
 
-Spline control points
+Equal-time canonical positions
 
 Playback animation
 
@@ -4411,11 +4425,7 @@ collector:
 
 preprocessing:
 
-&#x20; spatial\_control\_points: 16
-
-&#x20; spline\_degree: 3
-
-&#x20; timing\_intervals: 12
+&#x20; equal\_time\_positions: 64
 
 &#x20; onset\_detector: default
 
@@ -4755,9 +4765,9 @@ Coordinate transforms
 
 Endpoint disk transform and inverse
 
-Spline basis evaluation
+Equal-time position resampling
 
-Spline fitting
+Piecewise-linear position interpolation
 
 Timing monotonicity
 
@@ -4877,9 +4887,9 @@ Python ONNX Runtime velocity network
 
 C++ ONNX Runtime velocity network
 
-Python spline decoder
+Python equal-time position decoder
 
-C++ spline decoder
+C++ equal-time position decoder
 
 ```
 
@@ -4956,6 +4966,10 @@ Slow target settling
 
 
 This permits complete pipeline testing before enough human data exists.
+
+
+
+For synthetic training-data generation, use the same temporary target sampler as collection: draw a target radius uniformly from 12–36 logical pixels, then draw its center continuously and uniformly from the feasible canvas interior. Record the seed, sampled center, radius, and realized start-to-target condition for every synthetic trial. This sampler must be revisited if coverage or validation shows weak performance for extreme distances, edge cases, or target sizes.
 
 
 
@@ -5207,7 +5221,7 @@ Target outside virtual desktop
 
 
 
-For `start == target center`, generate only endpoint settling or an optional click delay rather than dividing by zero.
+For `start == target center`, use the identity canonical transform and generate a short equal-time settling path with a positive total duration; do not divide by zero.
 
 
 
@@ -5327,9 +5341,9 @@ Session-held-out splits
 
 Canonical transform
 
-Spline fit
+Equal-time canonical positions
 
-Timing fit
+Total movement duration
 
 Reconstruction report
 
