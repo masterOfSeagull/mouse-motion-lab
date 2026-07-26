@@ -5,6 +5,7 @@ import ctypes
 import importlib.util
 from math import atan2, degrees, hypot, log2
 import random
+import time
 from pathlib import Path
 from typing import Any
 
@@ -97,6 +98,7 @@ class CollectionController(QObject):
         self._random = random.Random()
         self._scheduler: ContinuousUniformTargetScheduler | None = None
         self._pending_target: Any | None = None
+        self._target_activation_deadline_ns: int | None = None
         self._trial_token = 0
         self._active_trial_token = 0
         self._finishing = False
@@ -296,6 +298,7 @@ class CollectionController(QObject):
             )
             self._target_visible = True
             self._pending_target = target
+            self._target_activation_deadline_ns = time.monotonic_ns() + 120_000_000
             self._targetChanged()
             # `frameSwapped` is authoritative. Some Windows/Qt render paths do not emit it for this window,
             # so a bounded fallback prevents a visible target from becoming an unclickable dead state.
@@ -327,6 +330,7 @@ class CollectionController(QObject):
         if self._state != "active" or self._finishing or self._pending_target is None or self._capture is None:
             return
         self._presentation_fallback.stop()
+        self._target_activation_deadline_ns = None
         target = self._pending_target
         try:
             timestamp_ns, start_screen_x, start_screen_y = self._capture_timestamp_and_cursor()
@@ -425,6 +429,12 @@ class CollectionController(QObject):
             if self._writer.failure is not None:
                 self._fail(f"Parquet writer failed: {self._writer.failure}")
                 return
+            if (
+                self._pending_target is not None
+                and self._target_activation_deadline_ns is not None
+                and time.monotonic_ns() >= self._target_activation_deadline_ns
+            ):
+                self._activate_presented_target("presentation_fallback")
             if process_actions and not self._finishing:
                 for event in events:
                     if event.button_flags & RI_MOUSE_LEFT_BUTTON_DOWN:
@@ -512,6 +522,7 @@ class CollectionController(QObject):
         self._timer.stop()
         self._trial_timeout.stop()
         self._presentation_fallback.stop()
+        self._target_activation_deadline_ns = None
         self._target_visible = False
         self._pending_target = None
         self._targetChanged()
