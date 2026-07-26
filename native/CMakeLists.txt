@@ -1,0 +1,22 @@
+cmake_minimum_required(VERSION 3.21)
+project(MouseMotionLabNative LANGUAGES CXX)
+
+add_library(mousemotionlab_native_version STATIC src/version_stub.cpp)
+target_compile_features(mousemotionlab_native_version PUBLIC cxx_std_20)
+target_include_directories(mousemotionlab_native_version PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
+if (WIN32)
+  add_library(mousemotionlab_mouse_io SHARED mouse_io/src/mouse_io.cpp)
+  target_compile_features(mousemotionlab_mouse_io PUBLIC cxx_std_20)
+  target_compile_definitions(mousemotionlab_mouse_io PRIVATE MML_MOUSE_IO_EXPORTS UNICODE _UNICODE WIN32_LEAN_AND_MEAN)
+  target_include_directories(mousemotionlab_mouse_io PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/mouse_io/include)
+  target_link_libraries(mousemotionlab_mouse_io PRIVATE user32)
+
+  include(CTest)
+  if (BUILD_TESTING)
+    add_executable(mousemotionlab_mouse_io_tests mouse_io/tests/mouse_io_tests.cpp)
+    target_compile_features(mousemotionlab_mouse_io_tests PRIVATE cxx_std_20)
+    target_link_libraries(mousemotionlab_mouse_io_tests PRIVATE mousemotionlab_mouse_io)
+    add_test(NAME mousemotionlab_mouse_io_tests COMMAND mousemotionlab_mouse_io_tests)
+  endif()
+endif()

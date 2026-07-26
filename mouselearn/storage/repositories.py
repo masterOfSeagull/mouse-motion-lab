@@ -1,0 +1,345 @@
+from __future__ import annotations
+
+import json
+import sqlite3
+import uuid
+from datetime import UTC, datetime
+from typing import Any
+
+from mouselearn.domain.collection import (
+    CaptureHealthRecord,
+    CollectionPhaseMarker,
+    CollectionSessionPlan,
+    RawEventFileReference,
+    TrialFinalization,
+    TrialPlan,
+)
+
+
+def utcnow() -> str:
+    return datetime.now(UTC).isoformat()
+
+
+class Repositories:
+    def __init__(self, conn: sqlite3.Connection):
+        self.conn = conn
+
+    def set_status(self, key: str, value: str) -> None:
+        self.conn.execute("INSERT INTO application_status(key,value,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (key, value, utcnow()))
+
+    def get_status(self, key: str) -> str | None:
+        row = self.conn.execute("SELECT value FROM application_status WHERE key=?", (key,)).fetchone()
+        return None if row is None else row[0]
+
+    def set_setting(self, key: str, value: Any) -> None:
+        self.conn.execute("INSERT INTO settings(key,value_json,updated_at) VALUES(?,?,?) ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json,updated_at=excluded.updated_at", (key, json.dumps(value), utcnow()))
+
+    def get_setting(self, key: str) -> Any | None:
+        row = self.conn.execute("SELECT value_json FROM settings WHERE key=?", (key,)).fetchone()
+        return None if row is None else json.loads(row[0])
+
+    def audit(self, entity_type: str, entity_id: str, action: str, detail: dict[str, Any] | None = None) -> str:
+        event_id = str(uuid.uuid4())
+        self.conn.execute("INSERT INTO audit_events(id,entity_type,entity_id,action,detail_json,created_at) VALUES(?,?,?,?,?,?)", (event_id, entity_type, entity_id, action, json.dumps(detail or {}), utcnow()))
+        return event_id
+
+    def create_job(self, job_type: str) -> str:
+        job_id, now = str(uuid.uuid4()), utcnow()
+        self.conn.execute("INSERT INTO jobs(id,type,status,created_at,updated_at) VALUES(?,?,?,?,?)", (job_id, job_type, "queued", now, now))
+        self.audit("job", job_id, "queued", {"type": job_type})
+        return job_id
+
+    def update_job(self, job_id: str, status: str | None = None, progress: int | None = None, stage: str | None = None, error: str | None = None) -> None:
+        row = self.conn.execute("SELECT status FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown job: {job_id}")
+        now = utcnow()
+        fields, values = ["updated_at=?"], [now]
+        if status is not None:
+            fields.append("status=?"); values.append(status)
+            if status == "running": fields.append("started_at=COALESCE(started_at,?)"); values.append(now)
+            if status in {"completed", "failed", "cancelled"}: fields.append("finished_at=?"); values.append(now)
+        if progress is not None: fields.append("progress=?"); values.append(progress)
+        if stage is not None: fields.append("stage=?"); values.append(stage)
+        if error is not None: fields.append("error=?"); values.append(error)
+        values.append(job_id)
+        self.conn.execute(f"UPDATE jobs SET {', '.join(fields)} WHERE id=?", values)
+        if status is not None:
+            self.audit("job", job_id, status, {"progress": progress, "stage": stage, "error": error})
+
+    def job(self, job_id: str) -> dict[str, Any]:
+        row = self.conn.execute("SELECT * FROM jobs WHERE id=?", (job_id,)).fetchone()
+        if row is None: raise KeyError(job_id)
+        return dict(row)
+
+    def job_totals(self) -> dict[str, int]:
+        counts = {state: 0 for state in ("queued", "running", "completed", "failed", "cancelled")}
+        for row in self.conn.execute("SELECT status, count(*) AS total FROM jobs GROUP BY status"):
+            counts[row[0]] = row[1]
+        return counts
+
+    def reconcile_interrupted_jobs(self) -> int:
+        rows = self.conn.execute("SELECT id FROM jobs WHERE status='running'").fetchall()
+        for row in rows:
+            self.update_job(row[0], status="failed", error="interrupted before application startup")
+        return len(rows)
+
+    def create_collection_session(self, plan: CollectionSessionPlan) -> str:
+        """Create planned session metadata before collection can begin."""
+        session_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO recording_sessions(id,status,created_at) VALUES(?,?,?)",
+                (session_id, "planned", now),
+            )
+            self.conn.execute(
+                """INSERT INTO collection_session_details(
+                    session_id,display_name,mode,state,planned_trials,random_seed,config_json,environment_json,updated_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    session_id, plan.display_name, plan.mode, "planned", plan.planned_trials, plan.random_seed,
+                    json.dumps(plan.config, sort_keys=True), json.dumps(plan.environment, sort_keys=True), now,
+                ),
+            )
+            self.audit("collection_session", session_id, "planned", {"mode": plan.mode, "planned_trials": plan.planned_trials})
+        return session_id
+
+    def transition_collection_session(self, session_id: str, state: str, failure_reason: str | None = None) -> None:
+        """Advance a session through its explicit lifecycle and mirror legacy status."""
+        allowed = {
+            "planned": {"active", "failed", "cancelled"},
+            "active": {"paused", "completed", "failed", "cancelled"},
+            "paused": {"active", "failed", "cancelled"},
+            "completed": set(), "failed": set(), "cancelled": set(),
+        }
+        row = self.conn.execute("SELECT state FROM collection_session_details WHERE session_id=?", (session_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown collection session: {session_id}")
+        current = row[0]
+        if state not in allowed[current]:
+            raise ValueError(f"invalid collection session transition: {current} -> {state}")
+        now = utcnow()
+        terminal = state in {"completed", "failed", "cancelled"}
+        legacy_state = {"planned": "planned", "active": "active", "paused": "active", "completed": "completed", "failed": "discarded", "cancelled": "discarded"}[state]
+        with self.conn:
+            self.conn.execute(
+                """UPDATE collection_session_details
+                   SET state=?, failure_reason=?, started_at=CASE WHEN ?='active' THEN COALESCE(started_at, ?) ELSE started_at END,
+                       ended_at=CASE WHEN ? THEN ? ELSE ended_at END, updated_at=? WHERE session_id=?""",
+                (state, failure_reason, state, now, terminal, now, now, session_id),
+            )
+            self.conn.execute(
+                "UPDATE recording_sessions SET status=?, finished_at=CASE WHEN ? THEN ? ELSE finished_at END WHERE id=?",
+                (legacy_state, terminal, now, session_id),
+            )
+            self.audit("collection_session", session_id, state, {"failure_reason": failure_reason})
+
+    def collection_session(self, session_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            """SELECT s.id, s.status AS legacy_status, s.created_at, s.finished_at,
+                      d.display_name, d.mode, d.state, d.planned_trials, d.random_seed,
+                      d.config_json, d.environment_json, d.failure_reason, d.started_at, d.ended_at, d.updated_at
+               FROM recording_sessions AS s
+               JOIN collection_session_details AS d ON d.session_id=s.id WHERE s.id=?""",
+            (session_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(session_id)
+        result = dict(row)
+        result["config"] = json.loads(result.pop("config_json"))
+        result["environment"] = json.loads(result.pop("environment_json"))
+        return result
+
+    def update_collection_environment(self, session_id: str, values: dict[str, Any]) -> None:
+        session = self.collection_session(session_id)
+        environment = {**session["environment"], **values}
+        with self.conn:
+            self.conn.execute(
+                "UPDATE collection_session_details SET environment_json=?, updated_at=? WHERE session_id=?",
+                (json.dumps(environment, sort_keys=True), utcnow(), session_id),
+            )
+            self.audit("collection_session", session_id, "environment_updated", {"keys": sorted(values)})
+
+    def create_trial(self, plan: TrialPlan) -> str:
+        session_id = str(plan.session_id)
+        session = self.collection_session(session_id)
+        if session["state"] != "active":
+            raise RuntimeError("trials can only be created for an active collection session")
+        trial_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO trials(id,session_id,status,created_at) VALUES(?,?,?,?)",
+                (trial_id, session_id, "target_visible", now),
+            )
+            self.conn.execute(
+                """INSERT INTO trial_details(trial_id,condition_json,state,target_appeared_ns,start_screen_x,start_screen_y)
+                   VALUES(?,?,?,?,?,?)""",
+                (
+                    trial_id, json.dumps(plan.condition.model_dump(mode="json"), sort_keys=True), "target_visible",
+                    plan.target_appeared_ns, plan.start_screen_x, plan.start_screen_y,
+                ),
+            )
+            self.audit("trial", trial_id, "target_visible", {"session_id": session_id})
+        return trial_id
+
+    def finalize_trial(self, trial_id: str, finalization: TrialFinalization) -> None:
+        row = self.conn.execute("SELECT target_appeared_ns FROM trial_details WHERE trial_id=?", (trial_id,)).fetchone()
+        if row is None:
+            raise KeyError(f"unknown trial: {trial_id}")
+        target_appeared_ns = row[0]
+        if finalization.ended_ns < target_appeared_ns or any(click.timestamp_ns < target_appeared_ns for click in finalization.clicks):
+            raise ValueError("trial timestamps cannot precede target appearance")
+        first_click_ns = next((click.timestamp_ns for click in finalization.clicks), None)
+        valid_click_ns = next((click.timestamp_ns for click in finalization.clicks if click.is_valid), None)
+        with self.conn:
+            self.conn.execute(
+                """UPDATE trial_details SET state=?, first_click_ns=?, valid_click_ns=?, ended_ns=?, end_reason=?, clicks_json=?
+                   WHERE trial_id=?""",
+                (
+                    finalization.state, first_click_ns, valid_click_ns, finalization.ended_ns, finalization.end_reason,
+                    json.dumps([click.model_dump(mode="json") for click in finalization.clicks]), trial_id,
+                ),
+            )
+            self.conn.execute("UPDATE trials SET status=? WHERE id=?", (finalization.state, trial_id))
+            self.audit("trial", trial_id, finalization.state, {"end_reason": finalization.end_reason, "click_count": len(finalization.clicks)})
+
+    def trial(self, trial_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            """SELECT t.id, t.session_id, t.status, t.created_at, d.condition_json, d.state,
+                      d.target_appeared_ns, d.start_screen_x, d.start_screen_y,
+                      d.first_click_ns, d.valid_click_ns, d.ended_ns, d.end_reason, d.clicks_json
+               FROM trials AS t JOIN trial_details AS d ON d.trial_id=t.id WHERE t.id=?""",
+            (trial_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(trial_id)
+        result = dict(row)
+        result["condition"] = json.loads(result.pop("condition_json"))
+        result["clicks"] = json.loads(result.pop("clicks_json"))
+        return result
+
+    def record_raw_event_file(self, session_id: str, reference: RawEventFileReference) -> str:
+        self.collection_session(session_id)
+        file_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO raw_event_files(
+                    id,session_id,relative_path,format,status,event_count,first_timestamp_ns,last_timestamp_ns,
+                    qpc_frequency_hz,byte_count,sha256,created_at,finalized_at
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    file_id, session_id, reference.relative_path, "parquet", "complete", reference.event_count,
+                    reference.first_timestamp_ns, reference.last_timestamp_ns, reference.qpc_frequency_hz,
+                    reference.byte_count, reference.sha256, now, now,
+                ),
+            )
+            self.audit("raw_event_file", file_id, "recorded", {"session_id": session_id, "event_count": reference.event_count})
+        return file_id
+
+    def record_capture_health(self, session_id: str, record: CaptureHealthRecord) -> str:
+        self.collection_session(session_id)
+        event_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO capture_health_events(id,session_id,severity,code,occurred_at_ns,detail_json,created_at) VALUES(?,?,?,?,?,?,?)",
+                (event_id, session_id, record.severity, record.code, record.occurred_at_ns, json.dumps(record.detail, sort_keys=True), now),
+            )
+            self.audit("collection_session", session_id, f"capture_{record.severity}", {"code": record.code})
+        return event_id
+
+    def record_phase_marker(self, session_id: str, marker: CollectionPhaseMarker, trial_id: str | None = None) -> str:
+        self.collection_session(session_id)
+        if trial_id is not None:
+            trial = self.conn.execute("SELECT session_id FROM trials WHERE id=?", (trial_id,)).fetchone()
+            if trial is None:
+                raise KeyError(f"unknown trial: {trial_id}")
+            if trial[0] != session_id:
+                raise ValueError("phase marker trial does not belong to session")
+        marker_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO collection_phase_markers(
+                    id,session_id,trial_id,phase,timestamp_ns,screen_x,screen_y,detail_json,created_at
+                ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                (
+                    marker_id, session_id, trial_id, marker.phase, marker.timestamp_ns, marker.screen_x, marker.screen_y,
+                    json.dumps(marker.detail, sort_keys=True), now,
+                ),
+            )
+            self.audit("collection_phase_marker", marker_id, marker.phase, {"session_id": session_id, "trial_id": trial_id})
+        return marker_id
+
+    def phase_markers_for_trial(self, trial_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.conn.execute(
+            "SELECT * FROM collection_phase_markers WHERE trial_id=? ORDER BY timestamp_ns", (trial_id,)
+        )]
+
+    def raw_event_files(self, session_id: str) -> list[dict[str, Any]]:
+        return [dict(row) for row in self.conn.execute("SELECT * FROM raw_event_files WHERE session_id=? ORDER BY created_at", (session_id,))]
+
+    def set_session_review(self, session_id: str, disposition: str, reason: str = "") -> None:
+        if disposition not in {"retained", "discarded"}:
+            raise ValueError("session review disposition must be retained or discarded")
+        if len(reason) > 500:
+            raise ValueError("review reason must be at most 500 characters")
+        self.collection_session(session_id)
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO collection_session_reviews(session_id,disposition,reason,reviewed_at) VALUES(?,?,?,?)
+                   ON CONFLICT(session_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason, reviewed_at=excluded.reviewed_at""",
+                (session_id, disposition, reason, utcnow()),
+            )
+            self.audit("collection_session", session_id, f"review_{disposition}", {"reason": reason})
+
+    def set_trial_review(self, trial_id: str, disposition: str, reason: str = "") -> None:
+        if disposition not in {"retained", "discarded"}:
+            raise ValueError("trial review disposition must be retained or discarded")
+        if len(reason) > 500:
+            raise ValueError("review reason must be at most 500 characters")
+        if self.conn.execute("SELECT 1 FROM trials WHERE id=?", (trial_id,)).fetchone() is None:
+            raise KeyError(f"unknown trial: {trial_id}")
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO trial_reviews(trial_id,disposition,reason,reviewed_at) VALUES(?,?,?,?)
+                   ON CONFLICT(trial_id) DO UPDATE SET disposition=excluded.disposition, reason=excluded.reason, reviewed_at=excluded.reviewed_at""",
+                (trial_id, disposition, reason, utcnow()),
+            )
+            self.audit("trial", trial_id, f"review_{disposition}", {"reason": reason})
+
+    def collection_sessions_for_review(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT s.id, s.created_at, s.finished_at, d.display_name, d.state, d.planned_trials,
+                      COALESCE(sr.disposition, 'retained') AS review_disposition,
+                      COALESCE(sr.reason, '') AS review_reason,
+                      count(t.id) AS trial_count,
+                      sum(CASE WHEN t.status='completed' THEN 1 ELSE 0 END) AS completed_trials,
+                      sum(CASE WHEN tr.disposition='discarded' THEN 1 ELSE 0 END) AS discarded_trials
+               FROM recording_sessions AS s
+               JOIN collection_session_details AS d ON d.session_id=s.id
+               LEFT JOIN collection_session_reviews AS sr ON sr.session_id=s.id
+               LEFT JOIN trials AS t ON t.session_id=s.id
+               LEFT JOIN trial_reviews AS tr ON tr.trial_id=t.id
+               GROUP BY s.id ORDER BY s.created_at DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def trials_for_review(self, session_id: str) -> list[dict[str, Any]]:
+        self.collection_session(session_id)
+        rows = self.conn.execute(
+            """SELECT t.id, t.status, t.created_at, d.condition_json, d.target_appeared_ns, d.start_screen_x, d.start_screen_y, d.first_click_ns,
+                      d.valid_click_ns, d.ended_ns, d.end_reason, d.clicks_json,
+                      COALESCE(tr.disposition, 'retained') AS review_disposition,
+                      COALESCE(tr.reason, '') AS review_reason
+               FROM trials AS t
+               JOIN trial_details AS d ON d.trial_id=t.id
+               LEFT JOIN trial_reviews AS tr ON tr.trial_id=t.id
+               WHERE t.session_id=? ORDER BY d.target_appeared_ns""",
+            (session_id,),
+        ).fetchall()
+        results: list[dict[str, Any]] = []
+        for row in rows:
+            result = dict(row)
+            result["condition"] = json.loads(result.pop("condition_json"))
+            result["clicks"] = json.loads(result.pop("clicks_json"))
+            results.append(result)
+        return results
