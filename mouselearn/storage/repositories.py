@@ -417,13 +417,22 @@ class Repositories:
         return [dict(row) for row in rows]
 
     def current_protocol_dataset_sessions(self) -> list[dict[str, Any]]:
-        """Eligible sessions collected with the post-presentation protocol only."""
+        """Eligible sessions using the current protocol-3 uniform sampler only."""
         current: list[dict[str, Any]] = []
         for session in self.eligible_dataset_sessions():
             row = self.conn.execute(
                 "SELECT classification FROM collection_session_quality WHERE session_id=?", (session["id"],)
             ).fetchone()
-            if row is not None and row[0] == "current":
+            conditions = [json.loads(item[0]) for item in self.conn.execute(
+                """SELECT td.condition_json FROM trials t JOIN trial_details td ON td.trial_id=t.id
+                   WHERE t.session_id=? ORDER BY td.target_appeared_ns, t.id""", (session["id"],)
+            )]
+            is_protocol_three = bool(conditions) and all(
+                condition.get("collection_protocol_version") == 3
+                and condition.get("target_sampling_strategy") == "continuous_uniform_feasible_v3"
+                for condition in conditions
+            )
+            if row is not None and row[0] == "current" and is_protocol_three:
                 current.append(session)
         return current
 

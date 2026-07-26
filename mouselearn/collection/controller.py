@@ -25,7 +25,7 @@ from mouselearn.storage.repositories import Repositories
 
 from .native import MML_CAPTURE_BUFFER_OVERFLOW, MML_CAPTURE_OK, NativeCaptureError, NativeMouseCapture, WM_INPUT, native_library_path
 from .parquet import BoundedParquetWriter, CollectionPersistenceError
-from .targets import BalancedTargetScheduler
+from .targets import ContinuousUniformTargetScheduler
 
 
 RI_MOUSE_LEFT_BUTTON_DOWN = 0x0001
@@ -95,7 +95,7 @@ class CollectionController(QObject):
         self._writer: BoundedParquetWriter | None = None
         self._clicks: list[ClickRecord] = []
         self._random = random.Random()
-        self._scheduler: BalancedTargetScheduler | None = None
+        self._scheduler: ContinuousUniformTargetScheduler | None = None
         self._pending_target: Any | None = None
         self._trial_token = 0
         self._active_trial_token = 0
@@ -202,10 +202,12 @@ class CollectionController(QObject):
             conn, repos = self._repositories()
             try:
                 self._session_id = repos.create_collection_session(CollectionSessionPlan(
-                    display_name="Qt Quick collection", mode="balanced_coverage", planned_trials=planned_trials,
+                    display_name="Qt Quick collection", mode="standard", planned_trials=planned_trials,
                     random_seed=seed,
                     config={
-                        "collection_protocol_version": 2, "inter_trial_delay_ms": [400, 1200],
+                        "collection_protocol_version": 3, "target_sampling_strategy": "continuous_uniform_feasible_v3",
+                        "target_radius_logical_px": [12, 36], "target_edge_margin_logical_px": 12,
+                        "inter_trial_delay_ms": [400, 1200],
                         "trial_timeout_ms": 15_000, "writer_queue_batches": 64, "parquet_row_group_events": 4096,
                     },
                     environment={"native_library": str(self._capture.path)},
@@ -236,7 +238,7 @@ class CollectionController(QObject):
             self._planned_trials = planned_trials
             self._completed_trials = 0
             self._random.seed(seed)
-            self._scheduler = BalancedTargetScheduler(seed)
+            self._scheduler = ContinuousUniformTargetScheduler(seed)
             self._finishing = False
             self._filter = _RawInputEventFilter(self._capture)
             QGuiApplication.instance().installNativeEventFilter(self._filter)
@@ -274,7 +276,7 @@ class CollectionController(QObject):
             cursor_x, cursor_y = self._cursor_canvas_position()
             target = self._scheduler.next(width, height, cursor_x, cursor_y)
         except (NativeCaptureError, ValueError) as exc:
-            self._fail(f"Could not schedule cursor-relative target: {exc}")
+            self._fail(f"Could not schedule continuous-uniform target: {exc}")
             return
         radius = target.radius
         if width <= 2 * radius + 40 or height <= 2 * radius + 40:
@@ -325,7 +327,8 @@ class CollectionController(QObject):
                 requested_radius_px=target.requested_radius_px * dpr,
                 requested_angle_degrees=target.requested_angle_degrees,
                 requested_screen_region=target.requested_screen_region, requested_corner=target.requested_corner,
-                realized_corner=target.realized_corner, collection_protocol_version=2, reaction_time_confidence="high",
+                realized_corner=target.realized_corner, collection_protocol_version=3,
+                target_sampling_strategy=target.sampling_strategy, reaction_time_confidence="high",
             )
             conn, repos = self._repositories()
             try:

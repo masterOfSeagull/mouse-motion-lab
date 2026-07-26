@@ -79,7 +79,7 @@ def run_preprocessing(job_id: str, snapshot_id: str, root: Path | None = None) -
         _persist_then_emit(repos, WorkerEvent(event="stage_changed", job_id=job_id, stage="representing"))
         result = preprocess_dataset_snapshot(root, database_path(root), snapshot_id)
         _persist_then_emit(repos, WorkerEvent(event="metric", job_id=job_id, stage="representing", name="processed_trials", value=result["processed_trial_count"]))
-        _persist_then_emit(repos, WorkerEvent(event="metric", job_id=job_id, stage="representing", name="reconstruction_max_error", value=result["reconstruction"]["max_error"]))
+        _persist_then_emit(repos, WorkerEvent(event="metric", job_id=job_id, stage="representing", name="resampling_max_error", value=result["resampling"]["max_error"]))
         _persist_then_emit(repos, WorkerEvent(event="progress", job_id=job_id, stage="representing", progress=95))
         _persist_then_emit(repos, WorkerEvent(event="completed", job_id=job_id, message=f"Preprocessing complete: {result['processed_trial_count']} trials"))
         return 0

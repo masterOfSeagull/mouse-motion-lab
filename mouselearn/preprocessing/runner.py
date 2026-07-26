@@ -11,9 +11,7 @@ from pathlib import Path
 from typing import Any
 
 from mouselearn.datasets.snapshots import _file_digest, current_code_revision
-from mouselearn.representation.canonical import CanonicalTransform, encode_endpoint
-from mouselearn.representation.spline import SplineSpec, fit_clamped_spline
-from mouselearn.representation.timing import fit_timing_representation
+from mouselearn.representation.canonical import CanonicalTransform
 from mouselearn.storage.database import connect, migrate
 from mouselearn.storage.repositories import Repositories
 
@@ -24,18 +22,17 @@ class PreprocessingError(RuntimeError):
 
 @dataclass(frozen=True)
 class PreprocessingSpec:
-    schema_version: int = 1
-    control_point_count: int = 16
-    smoothing: float = 1e-4
-    timing_interval_count: int = 12
+    schema_version: int = 2
+    equal_time_position_count: int = 64
+    onset_displacement_px: float = 3.0
 
     def __post_init__(self) -> None:
-        if self.schema_version != 1:
+        if self.schema_version != 2:
             raise ValueError("unsupported preprocessing schema version")
-        if self.control_point_count < 4:
-            raise ValueError("control_point_count must be at least 4")
-        if self.smoothing < 0 or self.timing_interval_count < 1:
-            raise ValueError("preprocessing parameters must be positive")
+        if self.equal_time_position_count < 2:
+            raise ValueError("equal_time_position_count must be at least 2")
+        if self.onset_displacement_px < 0:
+            raise ValueError("onset_displacement_px must be nonnegative")
 
     def config(self) -> dict[str, Any]:
         return asdict(self)
@@ -72,6 +69,56 @@ def _strict_points(
     if len(timestamps) < 2:
         raise PreprocessingError("trial has no positive-duration movement interval")
     return timestamps, [by_timestamp[timestamp] for timestamp in timestamps]
+
+
+def _movement_onset_index(points: list[tuple[float, float]], threshold_px: float) -> int:
+    """Ignore sub-threshold sensor drift without making reaction time a model target."""
+    origin = points[0]
+    for index, point in enumerate(points[1:], start=1):
+        if math.dist(origin, point) >= threshold_px:
+            return index
+    return 0
+
+
+def _interpolate_position(
+    timestamps: list[int], points: list[tuple[float, float]], timestamp: int,
+) -> tuple[float, float]:
+    if timestamp <= timestamps[0]:
+        return points[0]
+    if timestamp >= timestamps[-1]:
+        return points[-1]
+    for index in range(1, len(timestamps)):
+        if timestamps[index] >= timestamp:
+            left_time, right_time = timestamps[index - 1], timestamps[index]
+            left, right = points[index - 1], points[index]
+            span = right_time - left_time
+            if span <= 0:
+                return right
+            weight = (timestamp - left_time) / span
+            return (left[0] + (right[0] - left[0]) * weight, left[1] + (right[1] - left[1]) * weight)
+    return points[-1]
+
+
+def _equal_time_positions(
+    timestamps: list[int], points: list[tuple[float, float]], count: int,
+) -> tuple[list[int], list[tuple[float, float]]]:
+    start, end = timestamps[0], timestamps[-1]
+    duration = end - start
+    if duration <= 0:
+        raise PreprocessingError("movement duration must be positive")
+    sampled_timestamps = [start + round(duration * index / (count - 1)) for index in range(count)]
+    sampled_timestamps[0], sampled_timestamps[-1] = start, end
+    return sampled_timestamps, [_interpolate_position(timestamps, points, timestamp) for timestamp in sampled_timestamps]
+
+
+def _resampling_error(
+    source_timestamps: list[int], source_points: list[tuple[float, float]],
+    sampled_timestamps: list[int], sampled_points: list[tuple[float, float]],
+) -> float:
+    return max(
+        math.dist(point, _interpolate_position(sampled_timestamps, sampled_points, timestamp))
+        for timestamp, point in zip(source_timestamps, source_points, strict=True)
+    )
 
 
 def _load_session_events(root: Path, manifest: dict[str, Any]) -> dict[str, list[tuple[int, int, int]]]:
@@ -134,11 +181,16 @@ def preprocess_dataset_snapshot(
         rows = _trial_rows(conn, snapshot_id)
         if not rows:
             raise PreprocessingError("snapshot contains no trials")
+        if any(
+            json.loads(row["condition_json"]).get("collection_protocol_version") != 3
+            or json.loads(row["condition_json"]).get("target_sampling_strategy") != "continuous_uniform_feasible_v3"
+            for row in rows
+        ):
+            raise PreprocessingError("preprocessing schema 2 requires protocol-3 continuous-uniform trials")
         records: list[dict[str, Any]] = []
         skipped: list[dict[str, str]] = []
-        errors: list[float] = []
+        resampling_errors: list[float] = []
         by_split: Counter[str] = Counter()
-        spline_spec = SplineSpec(control_point_count=spec.control_point_count, smoothing=spec.smoothing)
         for row in rows:
             try:
                 if row["start_screen_x"] is None or row["start_screen_y"] is None or row["valid_click_ns"] is None:
@@ -150,25 +202,30 @@ def preprocess_dataset_snapshot(
                 timestamps, screen_points = _strict_points(
                     int(row["target_appeared_ns"]), start, click, session_events.get(row["session_id"], []),
                 )
-                transform = CanonicalTransform.from_start_target(
-                    (float(start[0]), float(start[1])), target, float(condition["radius_px"]),
+                onset_index = _movement_onset_index(screen_points, spec.onset_displacement_px)
+                movement_timestamps, movement_points = timestamps[onset_index:], screen_points[onset_index:]
+                sampled_timestamps, sampled_screen_points = _equal_time_positions(
+                    movement_timestamps, movement_points, spec.equal_time_position_count,
                 )
-                canonical_points = [transform.forward(point) for point in screen_points]
-                spline = fit_clamped_spline(canonical_points, spline_spec)
-                timing = fit_timing_representation(timestamps, canonical_points, spec.timing_interval_count)
-                reconstructed = [spline.evaluate(parameter) for parameter in spline.parameters]
-                reconstruction_error = max(math.dist(actual, predicted) for actual, predicted in zip(canonical_points, reconstructed, strict=True))
-                click_canonical = canonical_points[-1]
-                endpoint_offset = ((click_canonical[0] - 1.0) / transform.canonical_target_radius, click_canonical[1] / transform.canonical_target_radius)
+                transform = CanonicalTransform.from_start_target(
+                    movement_points[0], target, float(condition["radius_px"]),
+                )
+                canonical_source_points = [transform.forward(point) for point in movement_points]
+                canonical_positions = [transform.forward(point) for point in sampled_screen_points]
+                canonical_positions[0] = (0.0, 0.0)
+                resampling_error = _resampling_error(
+                    movement_timestamps, canonical_source_points, sampled_timestamps, canonical_positions,
+                )
+                duration_ns = sampled_timestamps[-1] - sampled_timestamps[0]
                 records.append({
                     "trial_id": row["trial_id"], "session_id": row["session_id"], "split": row["split"], "ordinal": row["ordinal"],
-                    "duration_ns": timestamps[-1] - timestamps[0], "source_point_count": len(screen_points),
-                    "control_points": [[point[0], point[1]] for point in spline.control_points],
-                    "endpoint_latent": list(encode_endpoint(endpoint_offset)), "timing_logits": list(timing.interval_logits),
-                    "spline_rank": spline.rank, "spline_condition_number": spline.condition_number,
-                    "reconstruction_max_error": reconstruction_error,
+                    "schema_version": spec.schema_version, "movement_onset_ns": sampled_timestamps[0],
+                    "total_movement_duration_ns": duration_ns, "log_total_movement_duration": math.log(duration_ns),
+                    "source_point_count": len(movement_points),
+                    "canonical_positions": [[point[0], point[1]] for point in canonical_positions],
+                    "resampling_max_error": resampling_error,
                 })
-                errors.append(reconstruction_error)
+                resampling_errors.append(resampling_error)
                 by_split[row["split"]] += 1
             except (KeyError, ValueError, PreprocessingError) as exc:
                 skipped.append({"trial_id": row["trial_id"], "reason": str(exc)})
@@ -184,9 +241,10 @@ def preprocess_dataset_snapshot(
         except ImportError as exc:
             raise PreprocessingError("PyArrow is required for preprocessing") from exc
         report = {
-            "schema_version": 1, "snapshot_id": snapshot_id, "run_id": run_id, "config": config,
+            "schema_version": spec.schema_version, "snapshot_id": snapshot_id, "run_id": run_id, "config": config,
             "processed_trial_count": len(records), "skipped_trial_count": len(skipped), "split_counts": dict(sorted(by_split.items())),
-            "reconstruction": {"max_error": max(errors), "mean_error": sum(errors) / len(errors)}, "skipped_trials": skipped,
+            "resampling": {"max_error": max(resampling_errors), "mean_error": sum(resampling_errors) / len(resampling_errors)},
+            "skipped_trials": skipped,
         }
         report_path = run_dir / "reconstruction_report.json"
         report_path.write_text(_canonical_json(report) + "\n", encoding="utf-8")

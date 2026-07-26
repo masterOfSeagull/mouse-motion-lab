@@ -1,4 +1,4 @@
-"""Cursor-relative, stratified target selection for the collection game."""
+"""Target selection policies for the collection game."""
 from __future__ import annotations
 
 from dataclasses import dataclass
@@ -15,12 +15,13 @@ class ScheduledTarget:
     angle_degrees: float
     screen_region: str
     difficulty_band: str
-    requested_distance_px: float
-    requested_radius_px: float
-    requested_angle_degrees: float
-    requested_screen_region: str
+    requested_distance_px: float | None
+    requested_radius_px: float | None
+    requested_angle_degrees: float | None
+    requested_screen_region: str | None
     requested_corner: str | None
     realized_corner: str | None
+    sampling_strategy: str
 
 
 @dataclass(frozen=True)
@@ -94,7 +95,7 @@ class BalancedTargetScheduler:
             screen_region=region, difficulty_band=self._difficulty_band(difficulty),
             requested_distance_px=cell.distance, requested_radius_px=cell.radius,
             requested_angle_degrees=cell.angle, requested_screen_region=cell.region,
-            requested_corner=cell.corner, realized_corner=corner,
+            requested_corner=cell.corner, realized_corner=corner, sampling_strategy="balanced_cartesian_v2",
         )
 
     @staticmethod
@@ -116,3 +117,38 @@ class BalancedTargetScheduler:
         if index_of_difficulty < 4:
             return "medium"
         return "high"
+
+
+class ContinuousUniformTargetScheduler:
+    """Protocol-3 target sampler: uniform feasible target centers and radii."""
+
+    radius_min = 12
+    radius_max = 36
+    edge_margin = 12
+
+    def __init__(self, seed: int):
+        self._random = random.Random(seed)
+
+    def next(self, width: int, height: int, cursor_x: float | None = None, cursor_y: float | None = None) -> ScheduledTarget:
+        required = 2 * (self.radius_max + self.edge_margin) + 1
+        if width < required or height < required:
+            raise ValueError(f"collection canvas must be at least {required} by {required} pixels")
+        # The renderer uses integer logical pixels; sampling is uniform over every feasible pixel center.
+        radius = self._random.randint(self.radius_min, self.radius_max)
+        minimum, maximum_x = radius + self.edge_margin, width - radius - self.edge_margin
+        maximum_y = height - radius - self.edge_margin
+        x = self._random.randint(minimum, maximum_x)
+        y = self._random.randint(minimum, maximum_y)
+        cursor_x = width / 2 if cursor_x is None else cursor_x
+        cursor_y = height / 2 if cursor_y is None else cursor_y
+        distance = hypot(x - cursor_x, y - cursor_y)
+        angle = degrees(atan2(y - cursor_y, x - cursor_x)) % 360 if distance else 0.0
+        region, corner = BalancedTargetScheduler._region_of(x, y, width, height)
+        difficulty = log2(distance / (2 * radius) + 1) if distance else 0.0
+        return ScheduledTarget(
+            x=x, y=y, radius=radius, distance_px=distance, angle_degrees=angle,
+            screen_region=region, difficulty_band=BalancedTargetScheduler._difficulty_band(difficulty),
+            requested_distance_px=None, requested_radius_px=radius, requested_angle_degrees=None,
+            requested_screen_region=None, requested_corner=None, realized_corner=corner,
+            sampling_strategy="continuous_uniform_feasible_v3",
+        )

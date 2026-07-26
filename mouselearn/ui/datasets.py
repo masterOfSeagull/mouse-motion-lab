@@ -55,9 +55,9 @@ class DatasetController(QObject):
                 if candidate.is_relative_to(self.root.resolve()) and candidate.is_file():
                     try:
                         report = json.loads(candidate.read_text(encoding="utf-8"))
-                        run["reconstruction_max_error"] = report.get("reconstruction", {}).get("max_error")
+                        run["resampling_max_error"] = report.get("resampling", {}).get("max_error")
                     except (OSError, json.JSONDecodeError):
-                        run["reconstruction_max_error"] = None
+                        run["resampling_max_error"] = None
         finally:
             conn.close()
         self.snapshotsChanged.emit()
@@ -72,14 +72,14 @@ class DatasetController(QObject):
             finally:
                 conn.close()
             if not current_sessions:
-                raise ValueError("No retained current-protocol sessions are eligible. Record a protocol-2 session first.")
+                raise ValueError("No retained protocol-3 sessions are eligible. Record a continuous-uniform protocol-3 session first.")
             snapshot = build_dataset_snapshot(
                 self.root, self.database,
                 DatasetSnapshotPlan(name=name.strip() or "Current protocol dataset", session_ids=tuple(row["id"] for row in current_sessions)),
             )
             self._message = (
                 f"Snapshot {snapshot['id'][:8]} is ready: {snapshot['trial_count']} trials from "
-                f"{snapshot['session_count']} current-protocol session(s)."
+                f"{snapshot['session_count']} protocol-3 session(s)."
             )
         except (DatasetBuildError, ValueError) as exc:
             self._message = f"Could not build snapshot: {exc}"
@@ -96,8 +96,27 @@ class DatasetController(QObject):
                 conn.close()
             if snapshot["status"] != "ready":
                 raise ValueError("Only ready snapshots can be preprocessed")
+            if any(
+                condition.get("collection_protocol_version") != 3
+                or condition.get("target_sampling_strategy") != "continuous_uniform_feasible_v3"
+                for condition in self._snapshot_conditions(snapshot["ordered_trial_ids"])
+            ):
+                raise ValueError("This snapshot is not protocol 3. Build a retained continuous-uniform protocol-3 snapshot first.")
             self._start_preprocessing(snapshot_id)
             self._message = f"Preprocessing {snapshot_id[:8]} in the background."
         except (KeyError, ValueError) as exc:
             self._message = f"Could not start preprocessing: {exc}"
         self.messageChanged.emit()
+
+    def _snapshot_conditions(self, trial_ids: list[str]) -> list[dict]:
+        if not trial_ids:
+            return []
+        conn = connect(self.database)
+        try:
+            placeholders = ",".join("?" for _ in trial_ids)
+            rows = conn.execute(
+                f"SELECT condition_json FROM trial_details WHERE trial_id IN ({placeholders})", trial_ids,
+            ).fetchall()
+            return [json.loads(row[0]) for row in rows]
+        finally:
+            conn.close()

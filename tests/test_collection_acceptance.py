@@ -4,7 +4,7 @@ from collections import Counter
 
 from mouselearn.collection.native import NativeMouseEvent
 from mouselearn.collection.parquet import BoundedParquetWriter
-from mouselearn.collection.targets import BalancedTargetScheduler
+from mouselearn.collection.targets import BalancedTargetScheduler, ContinuousUniformTargetScheduler
 from mouselearn.domain.collection import ClickRecord, CollectionSessionPlan, TargetCondition, TrialFinalization, TrialPlan
 from mouselearn.storage.bootstrap import initialize
 from mouselearn.storage.database import connect
@@ -28,6 +28,18 @@ def test_balanced_scheduler_is_reproducible_and_keeps_targets_on_canvas() -> Non
     assert cursor_relative.distance_px == ((cursor_relative.x - cursor_x) ** 2 + (cursor_relative.y - cursor_y) ** 2) ** 0.5
 
 
+def test_protocol_three_scheduler_is_reproducible_and_uniformly_feasible() -> None:
+    first = [ContinuousUniformTargetScheduler(7).next(1280, 720)]
+    scheduler = ContinuousUniformTargetScheduler(7)
+    targets = [scheduler.next(1280, 720) for _ in range(500)]
+    assert targets[0] == first[0]
+    assert {target.radius for target in targets}.issubset(set(range(12, 37)))
+    assert all(target.radius + 12 <= target.x <= 1280 - target.radius - 12 for target in targets)
+    assert all(target.radius + 12 <= target.y <= 720 - target.radius - 12 for target in targets)
+    assert all(target.sampling_strategy == "continuous_uniform_feasible_v3" for target in targets)
+    assert all(target.requested_distance_px is None and target.requested_angle_degrees is None for target in targets)
+
+
 def test_synthetic_500_trial_session_persists_without_loss(data_root) -> None:
     root, db, _ = initialize(data_root)
     conn = connect(db)
@@ -37,7 +49,7 @@ def test_synthetic_500_trial_session_persists_without_loss(data_root) -> None:
             display_name="500-trial acceptance", planned_trials=500, random_seed=19,
         ))
         repo.transition_collection_session(session_id, "active")
-        scheduler = BalancedTargetScheduler(19)
+        scheduler = ContinuousUniformTargetScheduler(19)
         events: list[NativeMouseEvent] = []
         for index in range(500):
             target = scheduler.next(1280, 720)
@@ -48,6 +60,8 @@ def test_synthetic_500_trial_session_persists_without_loss(data_root) -> None:
                     distance_px=target.distance_px, radius_px=target.radius, angle_degrees=target.angle_degrees,
                     screen_region=target.screen_region, difficulty_band=target.difficulty_band,
                     target_x=target.x, target_y=target.y, monitor_id="synthetic",
+                    requested_radius_px=target.requested_radius_px,
+                    collection_protocol_version=3, target_sampling_strategy=target.sampling_strategy,
                 ),
                 target_appeared_ns=appeared, start_screen_x=640, start_screen_y=360,
             ))
@@ -62,9 +76,11 @@ def test_synthetic_500_trial_session_persists_without_loss(data_root) -> None:
         assert writer.submit(events)
         repo.record_raw_event_file(session_id, writer.finalize())
         repo.transition_collection_session(session_id, "completed")
+        repo.set_collection_quality(session_id, "current", [])
 
         assert conn.execute("SELECT count(*) FROM trials WHERE session_id=? AND status='completed'", (session_id,)).fetchone()[0] == 500
         assert repo.raw_event_files(session_id)[0]["event_count"] == 500
         assert repo.collection_session(session_id)["state"] == "completed"
+        assert [session["id"] for session in repo.current_protocol_dataset_sessions()] == [session_id]
     finally:
         conn.close()

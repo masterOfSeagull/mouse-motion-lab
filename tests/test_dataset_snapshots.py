@@ -20,7 +20,8 @@ def _completed_session(root, repos: Repositories, index: int) -> str:
     repos.transition_collection_session(session_id, "active")
     target = TargetCondition(
         distance_px=200, radius_px=30, angle_degrees=0, screen_region="center", difficulty_band="medium",
-        target_x=500, target_y=300, monitor_id="test-monitor",
+        target_x=500, target_y=300, monitor_id="test-monitor", collection_protocol_version=3,
+        target_sampling_strategy="continuous_uniform_feasible_v3",
     )
     trial_id = repos.create_trial(TrialPlan(
         session_id=session_id, condition=target, target_appeared_ns=1_000 + index * 100,
@@ -113,10 +114,11 @@ def test_preprocessing_writes_deterministic_representation_and_report(data_root)
     try:
         repos = Repositories(conn)
         sessions = [_completed_session(root, repos, index) for index in range(3)]
-        for session_id in sessions:
+        for index, session_id in enumerate(sessions):
             raw_path = root / "raw_sessions" / session_id / "events.parquet"
+            start_timestamp = 1_000 + index * 100
             table = pa.table({
-                "timestamp_ns": [1_000, 1_050, 1_100], "raw_dx": [0, 100, 100], "raw_dy": [0, 0, 0],
+                "timestamp_ns": [start_timestamp, start_timestamp + 50, start_timestamp + 100], "raw_dx": [0, 100, 100], "raw_dy": [0, 0, 0],
                 "screen_x": [300, 400, 500], "screen_y": [300, 300, 300], "button_flags": [0, 0, 1],
                 "event_flags": [0, 0, 0], "device_handle": [1, 1, 1], "foreground_collection_window": [True, True, True],
             })
@@ -133,6 +135,9 @@ def test_preprocessing_writes_deterministic_representation_and_report(data_root)
     second = preprocess_dataset_snapshot(root, db, snapshot["id"])
     assert first["processed_trial_count"] == 3
     assert first["skipped_trial_count"] == 0
-    assert first["reconstruction"]["max_error"] < 1e-6
+    assert first["resampling"]["max_error"] < 1e-6
     assert json.loads((root / first["report_path"]).read_text())["processed_trial_count"] == 3
-    assert pq.read_table(root / first["processed_path"]).to_pylist() == pq.read_table(root / second["processed_path"]).to_pylist()
+    records = pq.read_table(root / first["processed_path"]).to_pylist()
+    assert len(records[0]["canonical_positions"]) == 64
+    assert records[0]["canonical_positions"][0] == [0.0, 0.0]
+    assert records == pq.read_table(root / second["processed_path"]).to_pylist()

@@ -36,6 +36,7 @@ class TargetCondition(StrictModel):
     requested_corner: Literal["top_left", "top_right", "bottom_left", "bottom_right"] | None = None
     realized_corner: Literal["top_left", "top_right", "bottom_left", "bottom_right"] | None = None
     collection_protocol_version: int = Field(default=1, ge=1)
+    target_sampling_strategy: str = Field(default="legacy_unknown", min_length=1, max_length=80)
     reaction_time_confidence: Literal["high", "legacy_render_unconfirmed"] = "legacy_render_unconfirmed"
 
 
