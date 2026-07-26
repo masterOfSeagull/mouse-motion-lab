@@ -29,6 +29,21 @@ from .targets import ContinuousUniformTargetScheduler
 
 
 RI_MOUSE_LEFT_BUTTON_DOWN = 0x0001
+SM_XVIRTUALSCREEN = 76
+SM_YVIRTUALSCREEN = 77
+SM_CXVIRTUALSCREEN = 78
+SM_CYVIRTUALSCREEN = 79
+
+
+def _virtual_screen_physical_bounds() -> dict[str, int]:
+    """Return the native coordinate extent used by Raw Input screen positions."""
+    user32 = ctypes.windll.user32
+    return {
+        "left": int(user32.GetSystemMetrics(SM_XVIRTUALSCREEN)),
+        "top": int(user32.GetSystemMetrics(SM_YVIRTUALSCREEN)),
+        "width": int(user32.GetSystemMetrics(SM_CXVIRTUALSCREEN)),
+        "height": int(user32.GetSystemMetrics(SM_CYVIRTUALSCREEN)),
+    }
 
 
 class _Point(ctypes.Structure):
@@ -226,6 +241,7 @@ class CollectionController(QObject):
                     "qpc_frequency_hz": stats.qpc_frequency_hz,
                     "coordinate_system": "native physical pixels; Qt logical pixels converted through ClientToScreen",
                     "qt_device_pixel_ratio": float(window.devicePixelRatio()),
+                    "virtual_screen_physical_bounds": _virtual_screen_physical_bounds(),
                 })
                 repos.transition_collection_session(self._session_id, "active")
                 repos.set_collection_quality(self._session_id, "current", [])
