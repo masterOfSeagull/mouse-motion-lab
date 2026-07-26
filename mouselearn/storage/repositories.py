@@ -395,7 +395,7 @@ class Repositories:
         return results
 
     def eligible_dataset_sessions(self) -> list[dict[str, Any]]:
-        """Completed, retained sessions with finalized raw evidence and valid trials."""
+        """Completed sessions, plus explicitly retained early-stopped sessions, with valid evidence."""
         rows = self.conn.execute(
             """SELECT s.id, s.created_at, d.display_name, count(t.id) AS trial_count
                FROM recording_sessions AS s
@@ -404,8 +404,10 @@ class Repositories:
                JOIN trials AS t ON t.session_id=s.id
                JOIN trial_details AS td ON td.trial_id=t.id
                LEFT JOIN trial_reviews AS tr ON tr.trial_id=t.id
-               WHERE s.status='completed' AND d.state='completed'
-                 AND COALESCE(sr.disposition, 'retained')='retained'
+               WHERE (
+                       (s.status='completed' AND d.state='completed' AND COALESCE(sr.disposition, 'retained')='retained')
+                    OR (s.status='discarded' AND d.state='cancelled' AND sr.disposition='retained')
+                 )
                  AND t.status='completed' AND td.valid_click_ns IS NOT NULL
                  AND COALESCE(tr.disposition, 'retained')='retained'
                  AND EXISTS(SELECT 1 FROM raw_event_files AS rf
@@ -457,6 +459,18 @@ class Repositories:
                 "Legacy collection protocol selected: realized geometry was recomputed where possible; "
                 "reaction-time values are not high-confidence ground truth."
             )
+        restored_cancelled_sessions = [row[0] for row in self.conn.execute(
+            f"""SELECT s.id FROM recording_sessions AS s
+                JOIN collection_session_details AS d ON d.session_id=s.id
+                JOIN collection_session_reviews AS sr ON sr.session_id=s.id
+                WHERE s.id IN ({placeholders}) AND s.status='discarded'
+                  AND d.state='cancelled' AND sr.disposition='retained'""",
+            selected_ids,
+        )]
+        if restored_cancelled_sessions:
+            warnings.append(
+                "Explicitly retained early-stopped sessions selected: only their completed trials are included."
+            )
         trial_rows = self.conn.execute(
             f"""SELECT t.id, t.session_id
                 FROM trials AS t
@@ -503,7 +517,11 @@ class Repositories:
             "feature_schema_version": plan.feature_schema_version,
             "code_revision": code_revision,
             "warnings": warnings,
-            "data_quality": {"legacy_session_ids": legacy_sessions, "reaction_time_high_confidence": not legacy_sessions},
+            "data_quality": {
+                "legacy_session_ids": legacy_sessions,
+                "restored_cancelled_session_ids": restored_cancelled_sessions,
+                "reaction_time_high_confidence": not legacy_sessions,
+            },
         }
         snapshot_id, now = str(uuid.uuid4()), utcnow()
         with self.conn:

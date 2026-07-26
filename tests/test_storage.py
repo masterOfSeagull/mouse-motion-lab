@@ -159,6 +159,35 @@ def test_review_discard_is_reversible_and_preserves_trials(data_root) -> None:
         conn.close()
 
 
+def test_explicitly_retained_early_stopped_session_is_dataset_eligible(data_root) -> None:
+    _, db, _ = initialize(data_root)
+    conn = connect(db)
+    try:
+        repo = Repositories(conn)
+        session_id = repo.create_collection_session(CollectionSessionPlan(display_name="short but clean", planned_trials=100, random_seed=2))
+        repo.transition_collection_session(session_id, "active")
+        trial_id = repo.create_trial(TrialPlan(
+            session_id=session_id,
+            condition=TargetCondition(distance_px=80, radius_px=24, angle_degrees=0, screen_region="center", difficulty_band="low", target_x=100, target_y=100, monitor_id="one"),
+            target_appeared_ns=10, start_screen_x=0, start_screen_y=0,
+        ))
+        repo.finalize_trial(trial_id, TrialFinalization(
+            state="completed", end_reason="valid_click", ended_ns=20,
+            clicks=(ClickRecord(timestamp_ns=20, screen_x=100, screen_y=100, is_valid=True),),
+        ))
+        repo.record_raw_event_file(session_id, RawEventFileReference(
+            relative_path=f"{session_id}/events.parquet", event_count=1, first_timestamp_ns=10,
+            last_timestamp_ns=20, qpc_frequency_hz=1_000_000, byte_count=10, sha256="0" * 64,
+        ))
+        repo.transition_collection_session(session_id, "cancelled")
+
+        assert session_id not in {row["id"] for row in repo.eligible_dataset_sessions()}
+        repo.set_session_review(session_id, "retained")
+        assert session_id in {row["id"] for row in repo.eligible_dataset_sessions()}
+    finally:
+        conn.close()
+
+
 def test_legacy_sessions_retain_data_but_recompute_realized_geometry(data_root) -> None:
     _, db, _ = initialize(data_root)
     conn = connect(db)
