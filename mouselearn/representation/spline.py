@@ -1,8 +1,10 @@
-"""Clamped cubic B-spline fitting with fixed endpoints and smoothness regularization."""
+"""Numerically stable clamped cubic B-spline fitting with explicit diagnostics."""
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+
+import numpy as np
 
 
 Point = tuple[float, float]
@@ -28,6 +30,8 @@ class SplineFit:
     spec: SplineSpec
     control_points: tuple[Point, ...]
     parameters: tuple[float, ...]
+    rank: int
+    condition_number: float
 
     def evaluate(self, parameter: float) -> Point:
         basis = bspline_basis(parameter, self.spec)
@@ -53,7 +57,6 @@ def _open_uniform_knots(spec: SplineSpec) -> tuple[float, ...]:
 
 
 def bspline_basis(parameter: float, spec: SplineSpec) -> tuple[float, ...]:
-    """Cox-de Boor basis for an open clamped knot vector."""
     parameter = min(1.0, max(0.0, parameter))
     knots = _open_uniform_knots(spec)
     count = spec.control_point_count
@@ -66,15 +69,12 @@ def bspline_basis(parameter: float, spec: SplineSpec) -> tuple[float, ...]:
     for degree in range(1, spec.degree + 1):
         next_values = [0.0] * count
         for index in range(count):
-            left = 0.0
             left_denom = knots[index + degree] - knots[index]
-            if left_denom:
-                left = (parameter - knots[index]) * values[index] / left_denom
+            left = (parameter - knots[index]) * values[index] / left_denom if left_denom else 0.0
             right = 0.0
             if index + 1 < count:
                 right_denom = knots[index + degree + 1] - knots[index + 1]
-                if right_denom:
-                    right = (knots[index + degree + 1] - parameter) * values[index + 1] / right_denom
+                right = (knots[index + degree + 1] - parameter) * values[index + 1] / right_denom if right_denom else 0.0
             next_values[index] = left + right
         values = next_values
     return tuple(values)
@@ -90,59 +90,46 @@ def chord_parameters(points: list[Point]) -> tuple[float, ...]:
     return tuple(distance / total for distance in distances)
 
 
-def _solve(matrix: list[list[float]], vector: list[float]) -> list[float]:
-    size = len(vector)
-    for column in range(size):
-        pivot = max(range(column, size), key=lambda row: abs(matrix[row][column]))
-        if abs(matrix[pivot][column]) < 1e-12:
-            matrix[column][column] += 1e-8
-            pivot = column
-        if pivot != column:
-            matrix[column], matrix[pivot] = matrix[pivot], matrix[column]
-            vector[column], vector[pivot] = vector[pivot], vector[column]
-        scale = matrix[column][column]
-        matrix[column] = [value / scale for value in matrix[column]]
-        vector[column] /= scale
-        for row in range(size):
-            if row == column:
-                continue
-            factor = matrix[row][column]
-            if factor:
-                matrix[row] = [value - factor * pivot_value for value, pivot_value in zip(matrix[row], matrix[column], strict=True)]
-                vector[row] -= factor * vector[column]
-    return vector
+def _regularization_rows(spec: SplineSpec, first: float, last: float) -> tuple[np.ndarray, np.ndarray]:
+    """Second-difference rows, adjusted for fixed start/end controls."""
+    free_count, control_count = spec.control_point_count - 2, spec.control_point_count
+    matrix = np.zeros((control_count - 2, free_count), dtype=np.float64)
+    target = np.zeros(control_count - 2, dtype=np.float64)
+    for row, center in enumerate(range(1, control_count - 1)):
+        fixed = 0.0
+        for control, value in ((center - 1, 1.0), (center, -2.0), (center + 1, 1.0)):
+            if control == 0:
+                fixed += value * first
+            elif control == control_count - 1:
+                fixed += value * last
+            else:
+                matrix[row, control - 1] = value
+        target[row] = -fixed
+    return matrix, target
 
 
-def _fit_coordinate(points: list[Point], parameters: tuple[float, ...], spec: SplineSpec, coordinate: int) -> list[float]:
-    count, free_count = spec.control_point_count, spec.control_point_count - 2
+def _fit_coordinate(points: list[Point], parameters: tuple[float, ...], spec: SplineSpec, coordinate: int) -> tuple[np.ndarray, int, float]:
+    control_count = spec.control_point_count
     first, last = points[0][coordinate], points[-1][coordinate]
-    matrix = [[0.0] * free_count for _ in range(free_count)]
-    vector = [0.0] * free_count
-    for point, parameter in zip(points, parameters, strict=True):
-        basis = bspline_basis(parameter, spec)
-        adjusted = point[coordinate] - basis[0] * first - basis[-1] * last
-        for row in range(free_count):
-            coefficient = basis[row + 1]
-            vector[row] += coefficient * adjusted
-            for column in range(free_count):
-                matrix[row][column] += coefficient * basis[column + 1]
+    basis = np.asarray([bspline_basis(parameter, spec) for parameter in parameters], dtype=np.float64)
+    design = basis[:, 1:-1]
+    values = np.asarray([point[coordinate] for point in points], dtype=np.float64)
+    target = values - basis[:, 0] * first - basis[:, -1] * last
     if spec.smoothing:
-        for index in range(1, count - 1):
-            terms = ((index - 1, 1.0), (index, -2.0), (index + 1, 1.0))
-            fixed = sum(value * (first if control == 0 else last) for control, value in terms if control in {0, count - 1})
-            free_terms = [(control - 1, value) for control, value in terms if 0 < control < count - 1]
-            for row, left in free_terms:
-                vector[row] -= spec.smoothing * left * fixed
-                for column, right in free_terms:
-                    matrix[row][column] += spec.smoothing * left * right
-    solved = _solve(matrix, vector)
-    return [first, *solved, last]
+        smooth_design, smooth_target = _regularization_rows(spec, first, last)
+        scale = math.sqrt(spec.smoothing)
+        design = np.vstack((design, smooth_design * scale))
+        target = np.concatenate((target, smooth_target * scale))
+    solution, _residuals, rank, singular_values = np.linalg.lstsq(design, target, rcond=None)
+    condition = float("inf") if not len(singular_values) or singular_values[-1] <= np.finfo(float).eps else float(singular_values[0] / singular_values[-1])
+    return np.concatenate(([first], solution, [last])), int(rank), condition
 
 
 def fit_clamped_spline(points: list[Point], spec: SplineSpec = SplineSpec()) -> SplineFit:
     if len(points) < 2:
         raise ValueError("at least two points are required for spline fitting")
     parameters = chord_parameters(points)
-    x_values = _fit_coordinate(points, parameters, spec, 0)
-    y_values = _fit_coordinate(points, parameters, spec, 1)
-    return SplineFit(spec, tuple(zip(x_values, y_values, strict=True)), parameters)
+    x_values, x_rank, x_condition = _fit_coordinate(points, parameters, spec, 0)
+    y_values, y_rank, y_condition = _fit_coordinate(points, parameters, spec, 1)
+    control_points = tuple((float(x), float(y)) for x, y in zip(x_values, y_values, strict=True))
+    return SplineFit(spec, control_points, parameters, min(x_rank, y_rank), max(x_condition, y_condition))

@@ -29,3 +29,4 @@ def test_bounded_parquet_writer_converts_qpc_ticks_to_nanoseconds(tmp_path) -> N
     table = pq.read_table(tmp_path / "raw_sessions" / reference.relative_path)
     assert table.column("timestamp_ns").to_pylist() == [1_000_000_000, 1_500_000_000]
     assert table.column("raw_dx").to_pylist() == [4, 5]
+    assert pq.ParquetFile(tmp_path / "raw_sessions" / reference.relative_path).metadata.num_row_groups == 1

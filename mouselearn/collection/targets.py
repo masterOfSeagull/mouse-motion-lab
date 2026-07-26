@@ -1,8 +1,8 @@
-"""Reproducible, balanced target selection for the collection game."""
+"""Cursor-relative, stratified target selection for the collection game."""
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import atan2, degrees, hypot, log2
+from math import atan2, cos, degrees, hypot, log2, radians, sin
 import random
 
 
@@ -15,62 +15,104 @@ class ScheduledTarget:
     angle_degrees: float
     screen_region: str
     difficulty_band: str
+    requested_distance_px: float
+    requested_radius_px: float
+    requested_angle_degrees: float
+    requested_screen_region: str
+    requested_corner: str | None
+    realized_corner: str | None
+
+
+@dataclass(frozen=True)
+class _ConditionCell:
+    distance: int
+    radius: int
+    angle: float
+    region: str
+    corner: str | None
 
 
 class BalancedTargetScheduler:
-    """Cycles every condition axis evenly while keeping targets within the canvas."""
+    """Shuffled Cartesian condition cells, realized from the cursor at target onset."""
 
     _distances = (80, 180, 350, 600)
     _radii = (8, 14, 24, 40)
+    _angles = tuple(index * 22.5 for index in range(16))
     _regions = ("center", "left", "right", "top", "bottom", "corner")
+    _corners = ("top_left", "top_right", "bottom_left", "bottom_right")
 
     def __init__(self, seed: int):
         self._random = random.Random(seed)
-        self._index = 0
-        self._distance_offset = self._random.randrange(len(self._distances))
-        self._radius_offset = self._random.randrange(len(self._radii))
-        self._angle_offset = self._random.randrange(16)
-        self._region_offset = self._random.randrange(len(self._regions))
+        self._cells = [
+            _ConditionCell(distance, radius, angle, region, corner)
+            for distance in self._distances
+            for radius in self._radii
+            for angle in self._angles
+            for region in self._regions
+            for corner in (self._corners if region == "corner" else (None,))
+        ]
+        self._deck: list[_ConditionCell] = []
 
-    def next(self, width: int, height: int) -> ScheduledTarget:
+    def _replenish(self) -> None:
+        if not self._deck:
+            self._deck = list(self._cells)
+            self._random.shuffle(self._deck)
+
+    def next(self, width: int, height: int, cursor_x: float | None = None, cursor_y: float | None = None) -> ScheduledTarget:
         if width < 100 or height < 100:
             raise ValueError("collection canvas must be at least 100 by 100 pixels")
-        index = self._index
-        self._index += 1
-        radius = self._radii[(index + self._radius_offset) % len(self._radii)]
-        margin = radius + 20
-        min_x, max_x = margin, max(margin, width - margin)
-        min_y, max_y = margin, max(margin, height - margin)
-        requested_distance = self._distances[(index + self._distance_offset) % len(self._distances)]
-        angle = ((index + self._angle_offset) % 16) * 22.5
-        region = self._regions[(index + self._region_offset) % len(self._regions)]
-        center_x, center_y = width / 2, height / 2
-        region_x, region_y = self._region_anchor(region, min_x, max_x, min_y, max_y, center_x, center_y)
-        # Keep the prescribed direction/distance as far as the selected region and canvas permit.
-        from math import cos, radians, sin
-        x = round(min(max(region_x + requested_distance * cos(radians(angle)), min_x), max_x))
-        y = round(min(max(region_y + requested_distance * sin(radians(angle)), min_y), max_y))
-        distance = hypot(x - center_x, y - center_y)
-        actual_angle = degrees(atan2(y - center_y, x - center_x)) % 360
-        index_of_difficulty = log2(distance / (2 * radius) + 1) if distance else 0.0
+        cursor_x = width / 2 if cursor_x is None else cursor_x
+        cursor_y = height / 2 if cursor_y is None else cursor_y
+        # Once every feasible cell for this cursor has been consumed, reshuffle a fresh Cartesian cycle.
+        for _cycle in range(2):
+            self._replenish()
+            rejected: list[_ConditionCell] = []
+            while self._deck:
+                cell = self._deck.pop()
+                target = self._realize(cell, width, height, cursor_x, cursor_y)
+                if target is not None:
+                    self._deck.extend(rejected)
+                    return target
+                rejected.append(cell)
+            self._deck = []
+        raise ValueError("no scheduled target cell fits the cursor position and collection canvas")
+
+    def _realize(self, cell: _ConditionCell, width: int, height: int, cursor_x: float, cursor_y: float) -> ScheduledTarget | None:
+        margin = cell.radius + 20
+        x = round(cursor_x + cell.distance * cos(radians(cell.angle)))
+        y = round(cursor_y + cell.distance * sin(radians(cell.angle)))
+        if not (margin <= x <= width - margin and margin <= y <= height - margin):
+            return None
+        region, corner = self._region_of(x, y, width, height)
+        if region != cell.region or (region == "corner" and corner != cell.corner):
+            return None
+        distance = hypot(x - cursor_x, y - cursor_y)
+        angle = degrees(atan2(y - cursor_y, x - cursor_x)) % 360
+        difficulty = log2(distance / (2 * cell.radius) + 1) if distance else 0.0
         return ScheduledTarget(
-            x=x, y=y, radius=radius, distance_px=distance, angle_degrees=actual_angle,
-            screen_region=region, difficulty_band=self._difficulty_band(index_of_difficulty),
+            x=x, y=y, radius=cell.radius, distance_px=distance, angle_degrees=angle,
+            screen_region=region, difficulty_band=self._difficulty_band(difficulty),
+            requested_distance_px=cell.distance, requested_radius_px=cell.radius,
+            requested_angle_degrees=cell.angle, requested_screen_region=cell.region,
+            requested_corner=cell.corner, realized_corner=corner,
         )
 
     @staticmethod
-    def _region_anchor(region: str, min_x: int, max_x: int, min_y: int, max_y: int, center_x: float, center_y: float) -> tuple[float, float]:
-        quarter_x, quarter_y = (min_x + max_x) / 4, (min_y + max_y) / 4
-        if region == "left": return min_x + quarter_x / 2, center_y
-        if region == "right": return max_x - quarter_x / 2, center_y
-        if region == "top": return center_x, min_y + quarter_y / 2
-        if region == "bottom": return center_x, max_y - quarter_y / 2
-        if region == "corner":
-            return (min_x + quarter_x / 2, min_y + quarter_y / 2) if (int(center_x + center_y) % 2 == 0) else (max_x - quarter_x / 2, max_y - quarter_y / 2)
-        return center_x, center_y
+    def _region_of(x: float, y: float, width: int, height: int) -> tuple[str, str | None]:
+        horizontal = "left" if x < width / 3 else "right" if x > width * 2 / 3 else "center"
+        vertical = "top" if y < height / 3 else "bottom" if y > height * 2 / 3 else "center"
+        if horizontal == "center" and vertical == "center":
+            return "center", None
+        if vertical == "center":
+            return horizontal, None
+        if horizontal == "center":
+            return vertical, None
+        return "corner", f"{vertical}_{horizontal}"
 
     @staticmethod
     def _difficulty_band(index_of_difficulty: float) -> str:
-        if index_of_difficulty < 2: return "low"
-        if index_of_difficulty < 4: return "medium"
+        if index_of_difficulty < 2:
+            return "low"
+        if index_of_difficulty < 4:
+            return "medium"
         return "high"

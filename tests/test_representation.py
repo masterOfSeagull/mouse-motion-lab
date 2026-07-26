@@ -28,6 +28,23 @@ def test_clamped_spline_reconstructs_a_smooth_trajectory() -> None:
     assert fit.control_points[-1] == pytest.approx(points[-1])
     assert max(errors) < 0.02
     assert len(fit.residual_controls()) == 14
+    assert fit.rank == 14
+    assert math.isfinite(fit.condition_number)
+
+
+@pytest.mark.parametrize("points", [
+    [(0.0, 0.0), (1.0, 0.0)],  # two-point path
+    [(0.0, 0.0), (0.0, 0.0), (0.0, 0.0), (0.001, 0.0)],  # stationary/very short
+    [(0.0, 0.0), (0.4, 0.2), (0.8, -0.3), (0.3, -0.1), (1.0, 0.0)],  # overshoot/reversal
+    [(0.0, 0.0), (0.7, 0.0), (0.93, 0.02), (0.75, -0.15), (1.0, 0.0)],  # sharp final correction
+])
+def test_spline_handles_degenerate_and_corrective_paths(points) -> None:
+    fit = fit_clamped_spline(points)
+    assert fit.control_points[0] == pytest.approx(points[0])
+    assert fit.control_points[-1] == pytest.approx(points[-1])
+    assert all(math.isfinite(value) for point in fit.control_points for value in point)
+    assert fit.rank > 0
+    assert math.isfinite(fit.condition_number) or math.isinf(fit.condition_number)
 
 
 def test_timing_logits_decode_to_monotonic_progress() -> None:

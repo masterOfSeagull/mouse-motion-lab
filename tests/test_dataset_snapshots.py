@@ -6,9 +6,9 @@ import sqlite3
 
 import pytest
 
-from mouselearn.datasets.snapshots import build_dataset_snapshot, session_held_out_assignments
+from mouselearn.datasets.snapshots import DatasetBuildError, build_dataset_snapshot
 from mouselearn.domain.collection import ClickRecord, CollectionSessionPlan, RawEventFileReference, TargetCondition, TrialFinalization, TrialPlan
-from mouselearn.domain.dataset import DatasetSnapshotPlan
+from mouselearn.domain.dataset import DatasetSnapshotPlan, SessionHeldOutSplit, session_held_out_assignments
 from mouselearn.storage.bootstrap import initialize
 from mouselearn.storage.database import connect
 from mouselearn.storage.repositories import Repositories
@@ -69,6 +69,35 @@ def test_snapshot_is_deterministic_immutable_and_session_held_out(data_root) -> 
 
 
 def test_session_held_out_warns_when_independence_is_impossible() -> None:
-    assignments, warnings = session_held_out_assignments(["session-a"], seed=3)
+    assignments, warnings = session_held_out_assignments(["session-a"], SessionHeldOutSplit(seed=3))
     assert assignments == {"session-a": "train"}
     assert warnings and "not independent" in warnings[0]
+
+
+def test_session_held_out_uses_the_configured_fractions() -> None:
+    session_ids = [f"session-{index}" for index in range(10)]
+    split = SessionHeldOutSplit(seed=9, train_fraction=0.5, validation_fraction=0.3, test_fraction=0.2)
+    assignments, warnings = session_held_out_assignments(session_ids, split)
+    assert not warnings
+    assert list(assignments.values()).count("train") == 5
+    assert list(assignments.values()).count("validation") == 3
+    assert list(assignments.values()).count("test") == 2
+
+
+def test_snapshot_failure_cleans_up_its_draft_and_directory(data_root) -> None:
+    root, db, _ = initialize(data_root)
+    conn = connect(db)
+    try:
+        session_id = _completed_session(root, Repositories(conn), 1)
+    finally:
+        conn.close()
+    raw_path = root / "raw_sessions" / session_id / "events.parquet"
+    raw_path.write_bytes(b"changed after recording")
+    with pytest.raises(DatasetBuildError, match="hash changed"):
+        build_dataset_snapshot(root, db, DatasetSnapshotPlan(name="should fail"))
+    conn = connect(db)
+    try:
+        assert conn.execute("SELECT count(*) FROM dataset_snapshots").fetchone()[0] == 0
+    finally:
+        conn.close()
+    assert list((root / "datasets").iterdir()) == []

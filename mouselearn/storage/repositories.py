@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from math import atan2, degrees, hypot, log2
 import sqlite3
 import uuid
 from datetime import UTC, datetime
@@ -275,6 +276,54 @@ class Repositories:
             "SELECT * FROM collection_phase_markers WHERE trial_id=? ORDER BY timestamp_ns", (trial_id,)
         )]
 
+    def set_collection_quality(self, session_id: str, classification: str, reasons: list[str]) -> None:
+        if classification not in {"legacy", "current"}:
+            raise ValueError("collection quality must be legacy or current")
+        self.collection_session(session_id)
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO collection_session_quality(session_id,classification,reasons_json,assessed_at) VALUES(?,?,?,?)
+                   ON CONFLICT(session_id) DO UPDATE SET classification=excluded.classification,
+                   reasons_json=excluded.reasons_json, assessed_at=excluded.assessed_at""",
+                (session_id, classification, json.dumps(reasons, sort_keys=True), utcnow()),
+            )
+            self.audit("collection_session", session_id, f"quality_{classification}", {"reasons": reasons})
+
+    def reconcile_legacy_collection_data(self) -> int:
+        """Preserve older recordings while replacing centre-based geometry with recoverable realized values."""
+        rows = self.conn.execute(
+            """SELECT t.id, t.session_id, d.condition_json, d.start_screen_x, d.start_screen_y
+               FROM trials AS t JOIN trial_details AS d ON d.trial_id=t.id
+               JOIN collection_session_quality AS q ON q.session_id=t.session_id
+               WHERE q.classification='legacy'"""
+        ).fetchall()
+        updated_sessions: set[str] = set()
+        with self.conn:
+            for row in rows:
+                condition = json.loads(row["condition_json"])
+                if condition.get("collection_protocol_version", 1) >= 2:
+                    continue
+                start_x, start_y = row["start_screen_x"], row["start_screen_y"]
+                if start_x is None or start_y is None:
+                    continue
+                dx, dy = condition["target_x"] - start_x, condition["target_y"] - start_y
+                distance = hypot(dx, dy)
+                condition.setdefault("requested_distance_px", condition.get("distance_px"))
+                condition.setdefault("requested_radius_px", condition.get("radius_px"))
+                condition.setdefault("requested_angle_degrees", condition.get("angle_degrees"))
+                condition.setdefault("requested_screen_region", condition.get("screen_region"))
+                condition["distance_px"] = distance
+                condition["angle_degrees"] = degrees(atan2(dy, dx)) % 360 if distance else 0.0
+                difficulty = log2(distance / (2 * condition["radius_px"]) + 1) if distance else 0.0
+                condition["difficulty_band"] = "low" if difficulty < 2 else "medium" if difficulty < 4 else "high"
+                condition["collection_protocol_version"] = 1
+                condition["reaction_time_confidence"] = "legacy_render_unconfirmed"
+                self.conn.execute("UPDATE trial_details SET condition_json=? WHERE trial_id=?", (json.dumps(condition, sort_keys=True), row["id"]))
+                updated_sessions.add(row["session_id"])
+            for session_id in updated_sessions:
+                self.audit("collection_session", session_id, "legacy_realized_geometry_recomputed", {})
+        return len(updated_sessions)
+
     def raw_event_files(self, session_id: str) -> list[dict[str, Any]]:
         return [dict(row) for row in self.conn.execute("SELECT * FROM raw_event_files WHERE session_id=? ORDER BY created_at", (session_id,))]
 
@@ -375,8 +424,19 @@ class Repositories:
         unavailable = [session_id for session_id in selected_ids if session_id not in eligible_by_id]
         if unavailable:
             raise ValueError("selected sessions are not eligible for a dataset snapshot: " + ", ".join(unavailable))
-        assignments, warnings = session_held_out_assignments(selected_ids, plan.split.seed)
+        assignments, warnings = session_held_out_assignments(selected_ids, plan.split)
         placeholders = ",".join("?" for _ in selected_ids)
+        legacy_sessions = [row[0] for row in self.conn.execute(
+            f"""SELECT s.id FROM recording_sessions AS s
+                LEFT JOIN collection_session_quality AS q ON q.session_id=s.id
+                WHERE s.id IN ({placeholders}) AND COALESCE(q.classification, 'legacy')='legacy'""",
+            selected_ids,
+        )]
+        if legacy_sessions:
+            warnings.append(
+                "Legacy collection protocol selected: realized geometry was recomputed where possible; "
+                "reaction-time values are not high-confidence ground truth."
+            )
         trial_rows = self.conn.execute(
             f"""SELECT t.id, t.session_id
                 FROM trials AS t
@@ -423,6 +483,7 @@ class Repositories:
             "feature_schema_version": plan.feature_schema_version,
             "code_revision": code_revision,
             "warnings": warnings,
+            "data_quality": {"legacy_session_ids": legacy_sessions, "reaction_time_high_confidence": not legacy_sessions},
         }
         snapshot_id, now = str(uuid.uuid4()), utcnow()
         with self.conn:
@@ -453,7 +514,8 @@ class Repositories:
             raise ValueError("manifest path must be relative to the data root")
         if len(manifest_sha256) != 64:
             raise ValueError("manifest hash must be a SHA-256 digest")
-        with self.conn:
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
             updated = self.conn.execute(
                 """UPDATE dataset_snapshot_details SET manifest_relative_path=?, manifest_sha256=?
                    WHERE snapshot_id=?""",
@@ -461,8 +523,35 @@ class Repositories:
             ).rowcount
             if updated != 1:
                 raise KeyError(snapshot_id)
-            self.conn.execute("UPDATE dataset_snapshots SET status='ready' WHERE id=? AND status='draft'", (snapshot_id,))
+            status_updated = self.conn.execute(
+                "UPDATE dataset_snapshots SET status='ready' WHERE id=? AND status='draft'", (snapshot_id,),
+            ).rowcount
+            if status_updated != 1:
+                raise RuntimeError("dataset snapshot was not in draft state")
             self.audit("dataset_snapshot", snapshot_id, "ready", {"manifest_sha256": manifest_sha256})
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def discard_dataset_snapshot_draft(self, snapshot_id: str, reason: str) -> None:
+        """Remove a never-ready draft after a manifest build failure; ready snapshots are immutable."""
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute("SELECT status FROM dataset_snapshots WHERE id=?", (snapshot_id,)).fetchone()
+            if row is None:
+                self.conn.execute("ROLLBACK")
+                return
+            if row[0] != "draft":
+                raise RuntimeError("only draft snapshots can be discarded")
+            self.audit("dataset_snapshot", snapshot_id, "draft_discarded", {"reason": reason})
+            self.conn.execute("DELETE FROM dataset_snapshot_trials WHERE snapshot_id=?", (snapshot_id,))
+            self.conn.execute("DELETE FROM dataset_snapshot_details WHERE snapshot_id=?", (snapshot_id,))
+            self.conn.execute("DELETE FROM dataset_snapshots WHERE id=?", (snapshot_id,))
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
 
     def dataset_snapshot(self, snapshot_id: str) -> dict[str, Any]:
         row = self.conn.execute(

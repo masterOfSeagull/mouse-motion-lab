@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Iterable
 
@@ -19,12 +20,19 @@ class CollectionPersistenceError(RuntimeError):
 class BoundedParquetWriter:
     """Write raw events off the GUI thread; queue exhaustion is a visible failure."""
 
-    def __init__(self, raw_sessions_root: Path, session_id: str, qpc_frequency_hz: int, queue_capacity: int = 64):
+    def __init__(
+        self, raw_sessions_root: Path, session_id: str, qpc_frequency_hz: int, queue_capacity: int = 64,
+        row_group_event_count: int = 4096, row_group_max_delay_seconds: float = 0.25,
+    ):
         if queue_capacity < 1:
             raise ValueError("queue_capacity must be positive")
+        if row_group_event_count < 1 or row_group_max_delay_seconds <= 0:
+            raise ValueError("row group thresholds must be positive")
         self.session_id = session_id
         self.qpc_frequency_hz = qpc_frequency_hz
         self.path = raw_sessions_root / session_id / "events.parquet"
+        self.row_group_event_count = row_group_event_count
+        self.row_group_max_delay_seconds = row_group_max_delay_seconds
         self._queue: queue.Queue[tuple[NativeMouseEvent, ...] | None] = queue.Queue(maxsize=queue_capacity)
         self._thread: threading.Thread | None = None
         self._failure: Exception | None = None
@@ -68,11 +76,14 @@ class BoundedParquetWriter:
             raise CollectionPersistenceError("raw event writer did not finish")
         if self._failure is not None:
             raise CollectionPersistenceError(str(self._failure)) from self._failure
-        digest = hashlib.sha256(self.path.read_bytes()).hexdigest()
+        digest = hashlib.sha256()
+        with self.path.open("rb") as stream:
+            for chunk in iter(lambda: stream.read(1_048_576), b""):
+                digest.update(chunk)
         return RawEventFileReference(
             relative_path=f"{self.session_id}/events.parquet", event_count=self._event_count,
             first_timestamp_ns=self._first_timestamp_ns, last_timestamp_ns=self._last_timestamp_ns,
-            qpc_frequency_hz=self.qpc_frequency_hz, byte_count=self.path.stat().st_size, sha256=digest,
+            qpc_frequency_hz=self.qpc_frequency_hz, byte_count=self.path.stat().st_size, sha256=digest.hexdigest(),
         )
 
     def _require_pyarrow(self) -> None:
@@ -94,10 +105,13 @@ class BoundedParquetWriter:
                 ("foreground_collection_window", pa.bool_()),
             ])
             with pq.ParquetWriter(self.path, schema, compression="zstd") as writer:
-                while True:
-                    batch = self._queue.get()
-                    if batch is None:
-                        break
+                pending: list[NativeMouseEvent] = []
+                last_flush = time.monotonic()
+
+                def flush_pending() -> None:
+                    nonlocal pending, last_flush
+                    if not pending:
+                        return
                     table = pa.Table.from_pylist([
                         {
                             "timestamp_ns": event.timestamp_ticks * 1_000_000_000 // self.qpc_frequency_hz,
@@ -106,13 +120,29 @@ class BoundedParquetWriter:
                             "event_flags": event.event_flags, "device_handle": event.device_handle,
                             "foreground_collection_window": bool(event.foreground_collection_window),
                         }
-                        for event in batch
+                        for event in pending
                     ], schema=schema)
                     writer.write_table(table)
+                    pending = []
+                    last_flush = time.monotonic()
+
+                while True:
+                    timeout = max(0.001, self.row_group_max_delay_seconds - (time.monotonic() - last_flush))
+                    try:
+                        batch = self._queue.get(timeout=timeout)
+                    except queue.Empty:
+                        flush_pending()
+                        continue
+                    if batch is None:
+                        break
+                    pending.extend(batch)
                     self._event_count += len(batch)
                     first = batch[0].timestamp_ticks * 1_000_000_000 // self.qpc_frequency_hz
                     last = batch[-1].timestamp_ticks * 1_000_000_000 // self.qpc_frequency_hz
                     self._first_timestamp_ns = first if self._first_timestamp_ns is None else min(self._first_timestamp_ns, first)
                     self._last_timestamp_ns = last if self._last_timestamp_ns is None else max(self._last_timestamp_ns, last)
+                    if len(pending) >= self.row_group_event_count:
+                        flush_pending()
+                flush_pending()
         except Exception as exc:  # propagated at the controlled finalize boundary
             self._failure = exc

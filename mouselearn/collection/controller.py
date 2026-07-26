@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import ctypes
 import importlib.util
+from math import atan2, degrees, hypot, log2
 import random
 from pathlib import Path
 from typing import Any
@@ -95,9 +96,17 @@ class CollectionController(QObject):
         self._clicks: list[ClickRecord] = []
         self._random = random.Random()
         self._scheduler: BalancedTargetScheduler | None = None
+        self._pending_target: Any | None = None
+        self._trial_token = 0
+        self._active_trial_token = 0
+        self._finishing = False
+        self._frame_signal: Any | None = None
         self._timer = QTimer(self)
         self._timer.setInterval(8)
         self._timer.timeout.connect(self._drain_capture)
+        self._trial_timeout = QTimer(self)
+        self._trial_timeout.setSingleShot(True)
+        self._trial_timeout.timeout.connect(self._on_trial_timeout)
 
     def _availability_message(self) -> str:
         if native_library_path() is None:
@@ -195,7 +204,10 @@ class CollectionController(QObject):
                 self._session_id = repos.create_collection_session(CollectionSessionPlan(
                     display_name="Qt Quick collection", mode="balanced_coverage", planned_trials=planned_trials,
                     random_seed=seed,
-                    config={"inter_trial_delay_ms": [400, 1200], "writer_queue_batches": 64},
+                    config={
+                        "collection_protocol_version": 2, "inter_trial_delay_ms": [400, 1200],
+                        "trial_timeout_ms": 15_000, "writer_queue_batches": 64, "parquet_row_group_events": 4096,
+                    },
                     environment={"native_library": str(self._capture.path)},
                 ))
             finally:
@@ -203,7 +215,9 @@ class CollectionController(QObject):
             self._capture.start(window_handle, capacity=16_384)
             stats = self._capture.stats()
             self._update_capture_stats(stats)
-            self._writer = BoundedParquetWriter(self.root / "raw_sessions", self._session_id, stats.qpc_frequency_hz)
+            self._writer = BoundedParquetWriter(
+                self.root / "raw_sessions", self._session_id, stats.qpc_frequency_hz, row_group_event_count=4096,
+            )
             self._writer.start()
             conn, repos = self._repositories()
             try:
@@ -213,6 +227,7 @@ class CollectionController(QObject):
                     "qt_device_pixel_ratio": float(window.devicePixelRatio()),
                 })
                 repos.transition_collection_session(self._session_id, "active")
+                repos.set_collection_quality(self._session_id, "current", [])
             finally:
                 conn.close()
             self._window = window
@@ -222,8 +237,13 @@ class CollectionController(QObject):
             self._completed_trials = 0
             self._random.seed(seed)
             self._scheduler = BalancedTargetScheduler(seed)
+            self._finishing = False
             self._filter = _RawInputEventFilter(self._capture)
             QGuiApplication.instance().installNativeEventFilter(self._filter)
+            self._frame_signal = getattr(window, "frameSwapped", None)
+            if self._frame_signal is None:
+                raise RuntimeError("collection window cannot confirm frame presentation")
+            self._frame_signal.connect(self._on_frame_swapped)
             self._timer.start()
             self._set_state("active", "Collection active. Raw Input is registered for this window only.")
             self._record_phase("inter_trial")
@@ -250,7 +270,12 @@ class CollectionController(QObject):
         if self._scheduler is None:
             self._fail("Target scheduler is not initialized.")
             return
-        target = self._scheduler.next(width, height)
+        try:
+            cursor_x, cursor_y = self._cursor_canvas_position()
+            target = self._scheduler.next(width, height, cursor_x, cursor_y)
+        except (NativeCaptureError, ValueError) as exc:
+            self._fail(f"Could not schedule cursor-relative target: {exc}")
+            return
         radius = target.radius
         if width <= 2 * radius + 40 or height <= 2 * radius + 40:
             self._fail("Collection window is too small for a target.")
@@ -263,14 +288,45 @@ class CollectionController(QObject):
             self._target_physical_x, self._target_physical_y = self._capture.client_to_screen(
                 int(self._window.winId()), round((self._canvas_x + self._target_x) * dpr), round((self._canvas_y + self._target_y) * dpr),
             )
-            condition = TargetCondition(
-                distance_px=target.distance_px * dpr, radius_px=radius * dpr, angle_degrees=target.angle_degrees,
-                screen_region=target.screen_region, difficulty_band=target.difficulty_band,
-                target_x=self._target_physical_x, target_y=self._target_physical_y, monitor_id="active-window",
-            )
             self._target_visible = True
+            self._pending_target = target
             self._targetChanged()
+        except (NativeCaptureError, RuntimeError, ValueError) as exc:
+            self._fail(f"Could not create trial: {exc}")
+            return
+        self._clicks = []
+
+    def _cursor_canvas_position(self) -> tuple[float, float]:
+        if self._capture is None or self._window is None:
+            raise NativeCaptureError("native capture is unavailable")
+        dpr = float(self._window.devicePixelRatio())
+        origin_x, origin_y = self._capture.client_to_screen(
+            int(self._window.winId()), round(self._canvas_x * dpr), round(self._canvas_y * dpr),
+        )
+        cursor_x, cursor_y = self._capture.cursor_position()
+        return (cursor_x - origin_x) / dpr, (cursor_y - origin_y) / dpr
+
+    def _on_frame_swapped(self) -> None:
+        """Only now is the target visibly presented and eligible for reaction timing/clicks."""
+        if self._state != "active" or self._finishing or self._pending_target is None or self._capture is None:
+            return
+        target = self._pending_target
+        try:
             timestamp_ns, start_screen_x, start_screen_y = self._capture_timestamp_and_cursor()
+            dpr = float(self._window.devicePixelRatio()) if self._window else 1.0
+            distance = hypot(self._target_physical_x - start_screen_x, self._target_physical_y - start_screen_y)
+            angle = degrees(atan2(self._target_physical_y - start_screen_y, self._target_physical_x - start_screen_x)) % 360
+            difficulty = log2(distance / (2 * target.radius * dpr) + 1) if distance else 0.0
+            condition = TargetCondition(
+                distance_px=distance, radius_px=target.radius * dpr, angle_degrees=angle,
+                screen_region=target.screen_region, difficulty_band=self._difficulty_band(difficulty),
+                target_x=self._target_physical_x, target_y=self._target_physical_y, monitor_id="active-window",
+                requested_distance_px=target.requested_distance_px * dpr,
+                requested_radius_px=target.requested_radius_px * dpr,
+                requested_angle_degrees=target.requested_angle_degrees,
+                requested_screen_region=target.requested_screen_region, requested_corner=target.requested_corner,
+                realized_corner=target.realized_corner, collection_protocol_version=2, reaction_time_confidence="high",
+            )
             conn, repos = self._repositories()
             try:
                 self._trial_id = repos.create_trial(TrialPlan(
@@ -284,10 +340,20 @@ class CollectionController(QObject):
                 )
             finally:
                 conn.close()
+            self._pending_target = None
+            self._trial_token += 1
+            self._active_trial_token = self._trial_token
+            self._trial_timeout.start(15_000)
         except (NativeCaptureError, RuntimeError, ValueError) as exc:
-            self._fail(f"Could not create trial: {exc}")
-            return
-        self._clicks = []
+            self._fail(f"Could not activate presented target: {exc}")
+
+    @staticmethod
+    def _difficulty_band(index_of_difficulty: float) -> str:
+        if index_of_difficulty < 2:
+            return "low"
+        if index_of_difficulty < 4:
+            return "medium"
+        return "high"
 
     def _targetChanged(self) -> None:
         self.targetChanged.emit()
@@ -320,8 +386,8 @@ class CollectionController(QObject):
         finally:
             conn.close()
 
-    def _drain_capture(self) -> None:
-        if self._state != "active" or self._capture is None or self._writer is None:
+    def _drain_capture(self, process_actions: bool = True) -> None:
+        if (self._state != "active" and not self._finishing) or self._capture is None or self._writer is None:
             return
         if self._filter and self._filter.failure_status is not None:
             self._fail(f"Raw Input handling failed with status {self._filter.failure_status}")
@@ -341,9 +407,10 @@ class CollectionController(QObject):
             if self._writer.failure is not None:
                 self._fail(f"Parquet writer failed: {self._writer.failure}")
                 return
-            for event in events:
-                if event.button_flags & RI_MOUSE_LEFT_BUTTON_DOWN:
-                    self._record_click(event)
+            if process_actions and not self._finishing:
+                for event in events:
+                    if event.button_flags & RI_MOUSE_LEFT_BUTTON_DOWN:
+                        self._record_click(event)
         except NativeCaptureError as exc:
             self._fail(str(exc))
 
@@ -364,28 +431,9 @@ class CollectionController(QObject):
             timestamp_ns=self._qpc_to_ns(event.timestamp_ticks), screen_x=event.screen_x, screen_y=event.screen_y, is_valid=valid,
         ))
         if valid:
-            conn, repos = self._repositories()
-            try:
-                repos.finalize_trial(self._trial_id, TrialFinalization(
-                    state="completed", end_reason="valid_click", ended_ns=self._qpc_to_ns(event.timestamp_ticks), clicks=tuple(self._clicks),
-                ))
-                repos.record_phase_marker(
-                    self._session_id,
-                    CollectionPhaseMarker(
-                        phase="trial_completed", timestamp_ns=self._qpc_to_ns(event.timestamp_ticks),
-                        screen_x=event.screen_x, screen_y=event.screen_y,
-                    ),
-                    self._trial_id,
-                )
-                repos.record_phase_marker(
-                    self._session_id,
-                    CollectionPhaseMarker(
-                        phase="inter_trial", timestamp_ns=self._qpc_to_ns(event.timestamp_ticks),
-                        screen_x=event.screen_x, screen_y=event.screen_y,
-                    ),
-                )
-            finally:
-                conn.close()
+            timestamp_ns = self._qpc_to_ns(event.timestamp_ticks)
+            self._finalize_active_trial("completed", "valid_click", "trial_completed", timestamp_ns, event.screen_x, event.screen_y)
+            self._record_phase("inter_trial", timestamp_ns=timestamp_ns, screen_x=event.screen_x, screen_y=event.screen_y)
             self._completed_trials += 1
             self._target_visible = False
             self._targetChanged()
@@ -394,6 +442,41 @@ class CollectionController(QObject):
                 self._finish("completed", "Collection completed.")
             else:
                 self._schedule_next_trial()
+
+    def _on_trial_timeout(self) -> None:
+        if self._state != "active" or self._finishing or not self._trial_id:
+            return
+        if self._active_trial_token != self._trial_token:
+            return
+        try:
+            timestamp_ns, screen_x, screen_y = self._capture_timestamp_and_cursor()
+            self._finalize_active_trial("failed", "timeout", "trial_timed_out", timestamp_ns, screen_x, screen_y)
+            self._target_visible = False
+            self._targetChanged()
+            self._schedule_next_trial()
+        except NativeCaptureError as exc:
+            self._fail(f"Could not finalize timed out trial: {exc}")
+
+    def _finalize_active_trial(
+        self, state: str, end_reason: str, phase: str, timestamp_ns: int, screen_x: int, screen_y: int,
+    ) -> None:
+        if not self._trial_id:
+            return
+        trial_id = self._trial_id
+        conn, repos = self._repositories()
+        try:
+            repos.finalize_trial(trial_id, TrialFinalization(
+                state=state, end_reason=end_reason, ended_ns=timestamp_ns, clicks=tuple(self._clicks),
+            ))
+            repos.record_phase_marker(
+                self._session_id,
+                CollectionPhaseMarker(phase=phase, timestamp_ns=timestamp_ns, screen_x=screen_x, screen_y=screen_y),
+                trial_id,
+            )
+        finally:
+            conn.close()
+        self._trial_id = ""
+        self._trial_timeout.stop()
 
     def _fail(self, message: str) -> None:
         if self._session_id:
@@ -405,22 +488,37 @@ class CollectionController(QObject):
         self._finish("failed", message)
 
     def _finish(self, terminal_state: str, message: str) -> None:
+        if self._finishing:
+            return
+        self._finishing = True
         self._timer.stop()
+        self._trial_timeout.stop()
         self._target_visible = False
+        self._pending_target = None
         self._targetChanged()
         if self._filter is not None:
             QGuiApplication.instance().removeNativeEventFilter(self._filter)
             self._filter = None
         if self._capture is not None:
-            if self._session_id:
-                try:
-                    self._record_phase("session_completed")
-                except NativeCaptureError:
-                    pass
             try:
                 self._capture.stop()
             except NativeCaptureError:
                 pass
+        # Capture has been unregistered; drain its preallocated ring before finalizing any metadata.
+        try:
+            while self._capture is not None and self._writer is not None:
+                status, events = self._capture.drain()
+                self._update_capture_stats(self._capture.stats())
+                if events and not self._writer.submit(events):
+                    terminal_state, message = "failed", "Parquet writer queue overflow during final capture drain."
+                    break
+                if not events:
+                    break
+                if status not in {MML_CAPTURE_OK, MML_CAPTURE_BUFFER_OVERFLOW}:
+                    terminal_state, message = "failed", f"Raw Input final drain failed with status {status}"
+                    break
+        except NativeCaptureError as exc:
+            terminal_state, message = "failed", f"Raw Input final drain failed: {exc}"
         file_reference = None
         writer_error: Exception | None = None
         if self._writer is not None:
@@ -433,15 +531,42 @@ class CollectionController(QObject):
         if self._session_id:
             conn, repos = self._repositories()
             try:
+                if self._trial_id:
+                    try:
+                        timestamp_ns, screen_x, screen_y = self._capture_timestamp_and_cursor()
+                    except NativeCaptureError:
+                        timestamp_ns, screen_x, screen_y = 0, 0, 0
+                    if terminal_state == "cancelled":
+                        self._finalize_active_trial("cancelled", "cancelled", "trial_cancelled", timestamp_ns, screen_x, screen_y)
+                    else:
+                        self._finalize_active_trial("failed", "capture_failure", "trial_failed", timestamp_ns, screen_x, screen_y)
                 if file_reference is not None:
                     repos.record_raw_event_file(self._session_id, file_reference)
+                phase = {
+                    "completed": "session_completed", "cancelled": "session_cancelled", "failed": "session_failed",
+                }[terminal_state]
+                try:
+                    timestamp_ns, screen_x, screen_y = self._capture_timestamp_and_cursor()
+                except NativeCaptureError:
+                    timestamp_ns, screen_x, screen_y = 0, 0, 0
+                repos.record_phase_marker(
+                    self._session_id,
+                    CollectionPhaseMarker(phase=phase, timestamp_ns=timestamp_ns, screen_x=screen_x, screen_y=screen_y),
+                )
                 repos.transition_collection_session(self._session_id, terminal_state, message if terminal_state == "failed" else None)
             finally:
                 conn.close()
+        if self._frame_signal is not None:
+            try:
+                self._frame_signal.disconnect(self._on_frame_swapped)
+            except (RuntimeError, TypeError):
+                pass
+            self._frame_signal = None
         self._capture = None
         self._writer = None
         self._trial_id = ""
         self._window = None
         self._canvas_width = 0
         self._canvas_height = 0
+        self._finishing = False
         self._set_state("idle", message)

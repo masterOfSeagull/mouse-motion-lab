@@ -18,6 +18,7 @@ CaptureSeverity = Literal["info", "warning", "error"]
 
 
 class TargetCondition(StrictModel):
+    """Realized geometry is authoritative; requested scheduler values retain provenance."""
     """The reproducible condition selected for one target trial."""
 
     distance_px: float = Field(ge=0)
@@ -28,6 +29,14 @@ class TargetCondition(StrictModel):
     target_x: int
     target_y: int
     monitor_id: str = Field(min_length=1, max_length=256)
+    requested_distance_px: float | None = Field(default=None, ge=0)
+    requested_radius_px: float | None = Field(default=None, gt=0)
+    requested_angle_degrees: float | None = Field(default=None, ge=0, lt=360)
+    requested_screen_region: Literal["center", "left", "right", "top", "bottom", "corner"] | None = None
+    requested_corner: Literal["top_left", "top_right", "bottom_left", "bottom_right"] | None = None
+    realized_corner: Literal["top_left", "top_right", "bottom_left", "bottom_right"] | None = None
+    collection_protocol_version: int = Field(default=1, ge=1)
+    reaction_time_confidence: Literal["high", "legacy_render_unconfirmed"] = "legacy_render_unconfirmed"
 
 
 class CollectionSessionPlan(StrictModel):
@@ -103,7 +112,10 @@ class CaptureHealthRecord(StrictModel):
 
 
 class CollectionPhaseMarker(StrictModel):
-    phase: Literal["inter_trial", "target_visible", "trial_completed", "session_completed"]
+    phase: Literal[
+        "inter_trial", "target_visible", "trial_completed", "trial_cancelled", "trial_failed", "trial_timed_out",
+        "session_completed", "session_cancelled", "session_failed",
+    ]
     timestamp_ns: int = Field(ge=0)
     screen_x: int | None = None
     screen_y: int | None = None

@@ -40,9 +40,9 @@ class DatasetSnapshotPlan(StrictModel):
         return self
 
 
-def session_held_out_assignments(session_ids: list[str], seed: int) -> tuple[dict[str, str], list[str]]:
+def session_held_out_assignments(session_ids: list[str], split: SessionHeldOutSplit) -> tuple[dict[str, str], list[str]]:
     """Deterministically keep every trial from a session in exactly one split."""
-    ordered = sorted(session_ids, key=lambda item: hashlib.sha256(f"{seed}:{item}".encode()).hexdigest())
+    ordered = sorted(session_ids, key=lambda item: hashlib.sha256(f"{split.seed}:{item}".encode()).hexdigest())
     count = len(ordered)
     if count == 0:
         raise ValueError("no eligible completed sessions were selected")
@@ -52,18 +52,21 @@ def session_held_out_assignments(session_ids: list[str], seed: int) -> tuple[dic
             f"Only {count} eligible session{' is' if count == 1 else 's are'} available; "
             "validation/test splits are not independent."
         )
-    validation_count = 0 if count < 3 else max(1, int(count * 0.15 + 0.5))
-    test_count = 0 if count == 1 else max(1, int(count * 0.15 + 0.5))
-    while validation_count + test_count >= count:
-        if validation_count > 0:
-            validation_count -= 1
-        elif test_count > 0:
-            test_count -= 1
-        else:
-            break
+    fractions = {"train": split.train_fraction, "validation": split.validation_fraction, "test": split.test_fraction}
+    counts = {name: int(count * fraction) for name, fraction in fractions.items()}
+    remaining = count - sum(counts.values())
+    for name in sorted(fractions, key=lambda item: (count * fractions[item] - counts[item], fractions[item], item), reverse=True)[:remaining]:
+        counts[name] += 1
+    if count >= 3:
+        for name, fraction in fractions.items():
+            if fraction > 0 and counts[name] == 0:
+                donor = max((candidate for candidate in counts if counts[candidate] > 1), key=counts.get, default=None)
+                if donor is not None:
+                    counts[donor] -= 1
+                    counts[name] += 1
     assignments: dict[str, str] = {}
     for index, session_id in enumerate(ordered):
-        assignments[session_id] = "test" if index < test_count else "validation" if index < test_count + validation_count else "train"
+        assignments[session_id] = "train" if index < counts["train"] else "validation" if index < counts["train"] + counts["validation"] else "test"
     return assignments, warnings
 
 

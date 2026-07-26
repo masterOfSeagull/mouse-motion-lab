@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        shell: pwsh
+        run: python -m pip install --upgrade pip; python -m pip install -e ".[dev]"
+      - name: Run Python and QML tests
+        shell: pwsh
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: .\tools\run-tests.ps1 -q
+      - name: Build native capture library
+        shell: pwsh
+        run: .\tools\build-native.ps1
+      - name: Run native ABI tests
+        shell: pwsh
+        run: ctest --test-dir build\native -C Release --output-on-failure

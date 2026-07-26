@@ -1,6 +1,6 @@
 # MouseMotionLab
 
-MouseMotionLab is a Windows-first mouse-motion research tool. Milestone 1 is complete. Milestone 2 is in progress: it now includes versioned collection metadata, explicit trial phase boundaries and cursor-at-appearance fields, a Windows Raw Input native library, a fullscreen Qt Quick target game, bounded Parquet raw-event persistence, and reversible session/trial review with trajectory previews. The deterministic 500-trial acceptance run passes; the real-hardware collection smoke test remains outstanding. It does not train models, generate trajectories, or play input back.
+MouseMotionLab is a Windows-first mouse-motion research tool. Milestones 1 and 2 are complete; Milestone 3 is in progress. Collection uses cursor-relative, stratified target conditions, frame-presented target activation, explicit timeouts/terminal phases, an allocation-free native ring buffer, buffered Parquet row groups, and reversible session/trial review with trajectory previews. Earlier recordings are retained and marked legacy: their realized geometry is recomputed where possible, but their reaction-time measurements are not high-confidence ground truth. It does not train models, generate trajectories, or play input back.
 
 ## Setup and run
 
@@ -21,7 +21,8 @@ The default data root is `%LOCALAPPDATA%\MouseMotionLab`; use `MOUSE_MOTION_LAB_
 - `apps/worker`: deterministic diagnostics JSONL subprocess.
 - `mouselearn/domain`: strict configuration and worker contracts.
 - `mouselearn/storage`: data root, logs, migrations, repositories.
-- `mouselearn/collection`: native capture adapter, bounded Parquet persistence, and Qt collection coordinator.
+- `mouselearn/collection`: cursor-relative scheduling, native capture adapter, buffered Parquet persistence, and Qt collection coordinator.
+- `mouselearn/datasets` and `mouselearn/representation`: immutable snapshots plus stable canonical/spline/timing foundations.
 - `native`: C++20 version stub plus a Windows Raw Input DLL; it remains independent from Qt and Python.
 
 Schema changes must be added as new SQLite migrations.

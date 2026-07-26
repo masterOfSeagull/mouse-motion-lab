@@ -20,6 +20,7 @@ enum mml_capture_status : uint32_t {
     MML_CAPTURE_REGISTER_FAILED = 3,
     MML_CAPTURE_RAW_INPUT_FAILED = 4,
     MML_CAPTURE_BUFFER_OVERFLOW = 5,
+    MML_CAPTURE_ABSOLUTE_MOUSE_UNSUPPORTED = 6,
 };
 
 #pragma pack(push, 1)

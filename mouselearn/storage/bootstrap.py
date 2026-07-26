@@ -13,7 +13,9 @@ def initialize(root: Path | None = None) -> tuple[Path, Path, int]:
     conn = connect(db_path)
     try:
         version = migrate(conn)
-        Repositories(conn).reconcile_interrupted_jobs()
+        repos = Repositories(conn)
+        repos.reconcile_interrupted_jobs()
+        repos.reconcile_legacy_collection_data()
     finally:
         conn.close()
     return root, db_path, version

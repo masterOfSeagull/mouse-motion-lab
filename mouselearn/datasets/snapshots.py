@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import shutil
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -24,6 +25,14 @@ def _digest(value: Any) -> str:
     return hashlib.sha256(_canonical_json(value).encode("utf-8")).hexdigest()
 
 
+def _file_digest(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1_048_576), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def current_code_revision() -> str:
     """Return the checkout revision when available; installed builds remain explicit."""
     try:
@@ -39,6 +48,8 @@ def current_code_revision() -> str:
 def build_dataset_snapshot(root: Path, database: Path, plan: DatasetSnapshotPlan) -> dict[str, Any]:
     """Create a manifest and make its database snapshot ready only after it is durable."""
     conn = connect(database)
+    draft: dict[str, Any] | None = None
+    snapshot_dir: Path | None = None
     try:
         migrate(conn)
         repos = Repositories(conn)
@@ -48,11 +59,12 @@ def build_dataset_snapshot(root: Path, database: Path, plan: DatasetSnapshotPlan
             candidate = (raw_root / raw_file["relative_path"]).resolve()
             if not candidate.is_relative_to(raw_root) or not candidate.is_file():
                 raise DatasetBuildError(f"raw evidence is missing: {raw_file['relative_path']}")
-            actual = hashlib.sha256(candidate.read_bytes()).hexdigest()
+            actual = _file_digest(candidate)
             if actual != raw_file["sha256"]:
                 raise DatasetBuildError(f"raw evidence hash changed: {raw_file['relative_path']}")
         manifest = draft["manifest"]
         manifest_path = root / "datasets" / draft["id"] / "manifest.json"
+        snapshot_dir = manifest_path.parent
         manifest_path.parent.mkdir(parents=True, exist_ok=False)
         temporary_path = manifest_path.with_suffix(".json.tmp")
         try:
@@ -64,6 +76,13 @@ def build_dataset_snapshot(root: Path, database: Path, plan: DatasetSnapshotPlan
         repos.finalize_dataset_snapshot(draft["id"], manifest_path.relative_to(root).as_posix(), _digest(manifest))
         return repos.dataset_snapshot(draft["id"])
     except Exception as exc:
+        if draft is not None:
+            try:
+                Repositories(conn).discard_dataset_snapshot_draft(draft["id"], str(exc))
+            except Exception:
+                pass
+        if snapshot_dir is not None and snapshot_dir.is_dir():
+            shutil.rmtree(snapshot_dir, ignore_errors=True)
         if isinstance(exc, DatasetBuildError):
             raise
         raise DatasetBuildError(str(exc)) from exc

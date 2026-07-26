@@ -21,14 +21,14 @@ from mouselearn.storage.repositories import Repositories
 
 def test_first_run_and_migrations_are_idempotent(data_root) -> None:
     root, db, version = initialize(data_root)
-    assert version == 5
+    assert version == 6
     assert db == root / "app.db"
     assert all((root / name).is_dir() for name in (
         "logs", "raw_sessions", "datasets", "experiments", "models", "exports", "cache", "temp",
     ))
     conn = connect(db)
     try:
-        assert migrate(conn) == 5
+        assert migrate(conn) == 6
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         conn.close()
@@ -41,11 +41,23 @@ def test_migration_four_upgrades_a_version_one_database(data_root) -> None:
         conn.executescript(MIGRATIONS[0][1])
         conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
         conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(1, '2026-07-26T00:00:00+00:00')")
-        assert migrate(conn) == 5
+        assert migrate(conn) == 6
         assert conn.execute("SELECT count(*) FROM pragma_table_info('raw_event_files')").fetchone()[0] > 0
         assert conn.execute("SELECT count(*) FROM pragma_table_info('trial_reviews')").fetchone()[0] > 0
         assert conn.execute("SELECT count(*) FROM pragma_table_info('collection_phase_markers')").fetchone()[0] > 0
         assert conn.execute("SELECT count(*) FROM pragma_table_info('dataset_snapshot_details')").fetchone()[0] > 0
+    finally:
+        conn.close()
+
+
+def test_failed_migration_rolls_back_all_schema_changes(data_root) -> None:
+    conn = connect(data_root / "atomic.db")
+    try:
+        failing = ((1, "CREATE TABLE must_not_remain(id INTEGER); CREATE TABLE must_not_remain(id INTEGER);"),)
+        with pytest.raises(sqlite3.OperationalError):
+            migrate(conn, migrations=failing)
+        assert conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='must_not_remain'").fetchone() is None
+        assert conn.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 0
     finally:
         conn.close()
 
@@ -142,6 +154,35 @@ def test_review_discard_is_reversible_and_preserves_trials(data_root) -> None:
         assert repo.trial(trial_id)["status"] == "completed"  # logical discard never deletes evidence
         repo.set_session_review(session_id, "retained")
         assert repo.collection_sessions_for_review()[0]["review_disposition"] == "retained"
+    finally:
+        conn.close()
+
+
+def test_legacy_sessions_retain_data_but_recompute_realized_geometry(data_root) -> None:
+    _, db, _ = initialize(data_root)
+    conn = connect(db)
+    try:
+        repo = Repositories(conn)
+        session_id = repo.create_collection_session(CollectionSessionPlan(display_name="legacy", planned_trials=1, random_seed=0))
+        repo.transition_collection_session(session_id, "active")
+        trial_id = repo.create_trial(TrialPlan(
+            session_id=session_id,
+            condition=TargetCondition(distance_px=1, radius_px=20, angle_degrees=0, screen_region="center", difficulty_band="low", target_x=300, target_y=200, monitor_id="one"),
+            target_appeared_ns=10, start_screen_x=100, start_screen_y=200,
+        ))
+        repo.finalize_trial(trial_id, TrialFinalization(
+            state="completed", end_reason="valid_click", ended_ns=20,
+            clicks=(ClickRecord(timestamp_ns=20, screen_x=300, screen_y=200, is_valid=True),),
+        ))
+        repo.transition_collection_session(session_id, "completed")
+        repo.set_collection_quality(session_id, "legacy", ["test"])
+        assert repo.reconcile_legacy_collection_data() == 1
+        trial = repo.trial(trial_id)
+        assert trial["condition"]["distance_px"] == 200
+        assert trial["condition"]["angle_degrees"] == 0
+        assert trial["condition"]["reaction_time_confidence"] == "legacy_render_unconfirmed"
+        repo.record_phase_marker(session_id, CollectionPhaseMarker(phase="session_cancelled", timestamp_ns=21))
+        assert repo.phase_markers_for_trial(trial_id) == []
     finally:
         conn.close()
 

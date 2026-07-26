@@ -18,10 +18,14 @@ def test_balanced_scheduler_is_reproducible_and_keeps_targets_on_canvas() -> Non
     assert targets[0] == first[0]
     assert all(target.radius <= target.x <= 1280 - target.radius for target in targets)
     assert all(target.radius <= target.y <= 720 - target.radius for target in targets)
-    radius_counts = Counter(target.radius for target in targets)
-    region_counts = Counter(target.screen_region for target in targets)
-    assert max(radius_counts.values()) - min(radius_counts.values()) <= 1
-    assert max(region_counts.values()) - min(region_counts.values()) <= 1
+    # Cartesian cells prevent the old distance/radius lockstep and corners are explicitly varied.
+    assert len({(target.requested_distance_px, target.requested_radius_px) for target in targets}) == 16
+    assert {target.realized_corner for target in targets if target.realized_corner} == {
+        "top_left", "top_right", "bottom_left", "bottom_right",
+    }
+    cursor_x, cursor_y = 640.0, 360.0
+    cursor_relative = BalancedTargetScheduler(13).next(1280, 720, cursor_x, cursor_y)
+    assert cursor_relative.distance_px == ((cursor_relative.x - cursor_x) ** 2 + (cursor_relative.y - cursor_y) ** 2) ** 0.5
 
 
 def test_synthetic_500_trial_session_persists_without_loss(data_root) -> None:

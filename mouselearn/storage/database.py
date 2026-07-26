@@ -188,6 +188,40 @@ CREATE TRIGGER dataset_snapshot_trials_delete_immutable
 BEFORE DELETE ON dataset_snapshot_trials
 WHEN (SELECT status FROM dataset_snapshots WHERE id=OLD.snapshot_id) = 'ready'
 BEGIN SELECT RAISE(ABORT, 'ready dataset snapshots are immutable'); END;
+"""), (6, """
+CREATE TABLE collection_session_quality (
+  session_id TEXT PRIMARY KEY REFERENCES recording_sessions(id) ON DELETE CASCADE,
+  classification TEXT NOT NULL CHECK(classification IN ('legacy','current')),
+  reasons_json TEXT NOT NULL,
+  assessed_at TEXT NOT NULL
+);
+INSERT INTO collection_session_quality(session_id,classification,reasons_json,assessed_at)
+SELECT id, 'legacy', '["scheduler_not_cursor_relative","target_presentation_not_confirmed"]', CURRENT_TIMESTAMP
+FROM recording_sessions;
+DROP INDEX idx_collection_phase_markers_trial;
+DROP INDEX idx_collection_phase_markers_session;
+CREATE TABLE collection_phase_markers_next (
+  id TEXT PRIMARY KEY,
+  session_id TEXT NOT NULL REFERENCES recording_sessions(id) ON DELETE CASCADE,
+  trial_id TEXT REFERENCES trials(id) ON DELETE CASCADE,
+  phase TEXT NOT NULL CHECK(phase IN (
+    'inter_trial','target_visible','trial_completed','trial_cancelled','trial_failed','trial_timed_out',
+    'session_completed','session_cancelled','session_failed'
+  )),
+  timestamp_ns INTEGER NOT NULL CHECK(timestamp_ns >= 0),
+  screen_x INTEGER,
+  screen_y INTEGER,
+  detail_json TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  CHECK((screen_x IS NULL AND screen_y IS NULL) OR (screen_x IS NOT NULL AND screen_y IS NOT NULL))
+);
+INSERT INTO collection_phase_markers_next
+SELECT id,session_id,trial_id,phase,timestamp_ns,screen_x,screen_y,detail_json,created_at
+FROM collection_phase_markers;
+DROP TABLE collection_phase_markers;
+ALTER TABLE collection_phase_markers_next RENAME TO collection_phase_markers;
+CREATE INDEX idx_collection_phase_markers_trial ON collection_phase_markers(trial_id, timestamp_ns);
+CREATE INDEX idx_collection_phase_markers_session ON collection_phase_markers(session_id, timestamp_ns);
 """),)
 
 
@@ -201,19 +235,37 @@ def connect(path: Path) -> sqlite3.Connection:
     return conn
 
 
-def migrate(conn: sqlite3.Connection) -> int:
+def _execute_script_transactionally(conn: sqlite3.Connection, script: str) -> None:
+    """Execute complete SQLite statements without executescript's implicit commits."""
+    statement = ""
+    for character in script:
+        statement += character
+        if sqlite3.complete_statement(statement):
+            if statement.strip():
+                conn.execute(statement)
+            statement = ""
+    if statement.strip():
+        raise RuntimeError("migration contains an incomplete SQL statement")
+
+
+def migrate(conn: sqlite3.Connection, migrations: tuple[tuple[int, str], ...] = MIGRATIONS) -> int:
     conn.execute("CREATE TABLE IF NOT EXISTS schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
     applied = {row[0] for row in conn.execute("SELECT version FROM schema_migrations")}
     from datetime import UTC, datetime
-    for version, sql in MIGRATIONS:
+    for version, sql in migrations:
         if version not in applied:
-            with conn:
-                conn.executescript(sql)
+            conn.execute("BEGIN IMMEDIATE")
+            try:
+                _execute_script_transactionally(conn, sql)
                 conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES (?, ?)", (version, datetime.now(UTC).isoformat()))
+                conn.execute("COMMIT")
+            except Exception:
+                conn.execute("ROLLBACK")
+                raise
     result = conn.execute("PRAGMA integrity_check").fetchone()[0]
     if result != "ok":
         raise RuntimeError(f"SQLite integrity check failed: {result}")
-    return max(version for version, _ in MIGRATIONS)
+    return max(version for version, _ in migrations)
 
 
 @contextmanager

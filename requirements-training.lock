@@ -1,0 +1,4 @@
+# Deliberately separate from the lightweight collection install.
+# Refresh this lock only after validating model reproducibility on Windows.
+torch==2.6.0
+onnxruntime==1.21.0
