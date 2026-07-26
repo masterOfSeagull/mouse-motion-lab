@@ -2079,13 +2079,21 @@ normalized target screen y
 
 
 
-distance to left screen edge
+start distance to left screen edge
 
-distance to right screen edge
+start distance to right screen edge
 
-distance to top screen edge
+start distance to top screen edge
 
-distance to bottom screen edge
+start distance to bottom screen edge
+
+target distance to left screen edge
+
+target distance to right screen edge
+
+target distance to top screen edge
+
+target distance to bottom screen edge
 
 
 
