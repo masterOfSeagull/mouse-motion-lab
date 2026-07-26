@@ -5,7 +5,6 @@ import ctypes
 import importlib.util
 from math import atan2, degrees, hypot, log2
 import random
-import time
 from pathlib import Path
 from typing import Any
 
@@ -98,20 +97,15 @@ class CollectionController(QObject):
         self._random = random.Random()
         self._scheduler: ContinuousUniformTargetScheduler | None = None
         self._pending_target: Any | None = None
-        self._target_activation_deadline_ns: int | None = None
         self._trial_token = 0
         self._active_trial_token = 0
         self._finishing = False
-        self._frame_signal: Any | None = None
         self._timer = QTimer(self)
         self._timer.setInterval(8)
         self._timer.timeout.connect(self._drain_capture)
         self._trial_timeout = QTimer(self)
         self._trial_timeout.setSingleShot(True)
         self._trial_timeout.timeout.connect(self._on_trial_timeout)
-        self._presentation_fallback = QTimer(self)
-        self._presentation_fallback.setSingleShot(True)
-        self._presentation_fallback.timeout.connect(self._on_presentation_fallback)
 
     def _availability_message(self) -> str:
         if native_library_path() is None:
@@ -212,8 +206,7 @@ class CollectionController(QObject):
                     config={
                         "collection_protocol_version": 3, "target_sampling_strategy": "continuous_uniform_feasible_v3",
                         "target_radius_logical_px": [12, 36], "target_edge_margin_logical_px": 12,
-                        "inter_trial_delay_ms": [400, 1200],
-                        "target_presentation_fallback_ms": 120,
+                        "inter_trial_delay_ms": [100, 300],
                         "trial_timeout_ms": 15_000, "writer_queue_batches": 64, "parquet_row_group_events": 4096,
                     },
                     environment={"native_library": str(self._capture.path)},
@@ -248,10 +241,6 @@ class CollectionController(QObject):
             self._finishing = False
             self._filter = _RawInputEventFilter(self._capture)
             QGuiApplication.instance().installNativeEventFilter(self._filter)
-            self._frame_signal = getattr(window, "frameSwapped", None)
-            if self._frame_signal is None:
-                raise RuntimeError("collection window cannot confirm frame presentation")
-            self._frame_signal.connect(self._on_frame_swapped)
             self._timer.start()
             self._set_state("active", "Collection active. Raw Input is registered for this window only.")
             self._record_phase("inter_trial")
@@ -268,7 +257,7 @@ class CollectionController(QObject):
     def _schedule_next_trial(self, delay_ms: int | None = None) -> None:
         if self._state != "active":
             return
-        delay = delay_ms if delay_ms is not None else self._random.randint(400, 1200)
+        delay = delay_ms if delay_ms is not None else self._random.randint(100, 300)
         QTimer.singleShot(delay, self._begin_trial)
 
     def _begin_trial(self) -> None:
@@ -298,15 +287,16 @@ class CollectionController(QObject):
             )
             self._target_visible = True
             self._pending_target = target
-            self._target_activation_deadline_ns = time.monotonic_ns() + 120_000_000
+            self._clicks = []
             self._targetChanged()
-            # `frameSwapped` is authoritative. Some Windows/Qt render paths do not emit it for this window,
-            # so a bounded fallback prevents a visible target from becoming an unclickable dead state.
-            self._presentation_fallback.start(120)
-        except (NativeCaptureError, RuntimeError, ValueError) as exc:
+            # The fullscreen child on this Windows/Qt combination can render while omitting
+            # both `frameSwapped` and controller-owned QTimer callbacks.  Do not leave a
+            # visible target unclickable: activate it now and explicitly mark reaction
+            # timing as render-unconfirmed.  Downstream preprocessing does not use RT.
+            self._activate_presented_target("legacy_render_unconfirmed")
+        except (NativeCaptureError, RuntimeError, TypeError, ValueError) as exc:
             self._fail(f"Could not create trial: {exc}")
             return
-        self._clicks = []
 
     def _cursor_canvas_position(self) -> tuple[float, float]:
         if self._capture is None or self._window is None:
@@ -318,19 +308,9 @@ class CollectionController(QObject):
         cursor_x, cursor_y = self._capture.cursor_position()
         return (cursor_x - origin_x) / dpr, (cursor_y - origin_y) / dpr
 
-    def _on_frame_swapped(self) -> None:
-        """Only now is the target visibly presented and eligible for reaction timing/clicks."""
-        self._activate_presented_target("high")
-
-    def _on_presentation_fallback(self) -> None:
-        """Mark a visible target active when Qt omitted frameSwapped; reaction timing remains lower confidence."""
-        self._activate_presented_target("presentation_fallback")
-
     def _activate_presented_target(self, reaction_time_confidence: str) -> None:
         if self._state != "active" or self._finishing or self._pending_target is None or self._capture is None:
             return
-        self._presentation_fallback.stop()
-        self._target_activation_deadline_ns = None
         target = self._pending_target
         try:
             timestamp_ns, start_screen_x, start_screen_y = self._capture_timestamp_and_cursor()
@@ -342,8 +322,12 @@ class CollectionController(QObject):
                 distance_px=distance, radius_px=target.radius * dpr, angle_degrees=angle,
                 screen_region=target.screen_region, difficulty_band=self._difficulty_band(difficulty),
                 target_x=self._target_physical_x, target_y=self._target_physical_y, monitor_id="active-window",
-                requested_distance_px=target.requested_distance_px * dpr,
-                requested_radius_px=target.requested_radius_px * dpr,
+                requested_distance_px=(
+                    target.requested_distance_px * dpr if target.requested_distance_px is not None else None
+                ),
+                requested_radius_px=(
+                    target.requested_radius_px * dpr if target.requested_radius_px is not None else None
+                ),
                 requested_angle_degrees=target.requested_angle_degrees,
                 requested_screen_region=target.requested_screen_region, requested_corner=target.requested_corner,
                 realized_corner=target.realized_corner, collection_protocol_version=3,
@@ -366,7 +350,7 @@ class CollectionController(QObject):
             self._trial_token += 1
             self._active_trial_token = self._trial_token
             self._trial_timeout.start(15_000)
-        except (NativeCaptureError, RuntimeError, ValueError) as exc:
+        except (NativeCaptureError, RuntimeError, TypeError, ValueError) as exc:
             self._fail(f"Could not activate presented target: {exc}")
 
     @staticmethod
@@ -429,12 +413,6 @@ class CollectionController(QObject):
             if self._writer.failure is not None:
                 self._fail(f"Parquet writer failed: {self._writer.failure}")
                 return
-            if (
-                self._pending_target is not None
-                and self._target_activation_deadline_ns is not None
-                and time.monotonic_ns() >= self._target_activation_deadline_ns
-            ):
-                self._activate_presented_target("presentation_fallback")
             if process_actions and not self._finishing:
                 for event in events:
                     if event.button_flags & RI_MOUSE_LEFT_BUTTON_DOWN:
@@ -521,8 +499,6 @@ class CollectionController(QObject):
         self._finishing = True
         self._timer.stop()
         self._trial_timeout.stop()
-        self._presentation_fallback.stop()
-        self._target_activation_deadline_ns = None
         self._target_visible = False
         self._pending_target = None
         self._targetChanged()
@@ -586,12 +562,6 @@ class CollectionController(QObject):
                 repos.transition_collection_session(self._session_id, terminal_state, message if terminal_state == "failed" else None)
             finally:
                 conn.close()
-        if self._frame_signal is not None:
-            try:
-                self._frame_signal.disconnect(self._on_frame_swapped)
-            except (RuntimeError, TypeError):
-                pass
-            self._frame_signal = None
         self._capture = None
         self._writer = None
         self._trial_id = ""

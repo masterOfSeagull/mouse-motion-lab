@@ -1,39 +1,66 @@
 from __future__ import annotations
 
-from types import SimpleNamespace
-from unittest.mock import Mock
-
 from mouselearn.collection.controller import CollectionController
-from mouselearn.collection.native import MML_CAPTURE_OK
+from mouselearn.collection.targets import ContinuousUniformTargetScheduler
+from mouselearn.domain.collection import CollectionSessionPlan
+from mouselearn.storage.bootstrap import initialize
+from mouselearn.storage.database import connect
+from mouselearn.storage.repositories import Repositories
+
+
+class _Window:
+    def devicePixelRatio(self) -> float:  # noqa: N802 - Qt API spelling
+        return 1.0
+
+    def winId(self) -> int:  # noqa: N802 - Qt API spelling
+        return 1
 
 
 class _Capture:
-    def drain(self):
-        return MML_CAPTURE_OK, []
+    def client_to_screen(self, _window_handle: int, x: int, y: int) -> tuple[int, int]:
+        return x, y
+
+    def cursor_position(self) -> tuple[int, int]:
+        return 100, 100
+
+    def qpc_now(self) -> int:
+        return 1_000_000
 
     def stats(self):
-        return SimpleNamespace(
-            observed_events=0,
-            buffered_events=0,
-            overflow_events=0,
-            qpc_frequency_hz=1_000_000,
-        )
+        class _Stats:
+            qpc_frequency_hz = 1_000_000
+
+        return _Stats()
 
 
-class _Writer:
-    failure = None
+def test_protocol_three_target_with_no_requested_distance_creates_a_trial(qtbot, tmp_path) -> None:
+    """Uniform Protocol-3 conditions intentionally leave requested distance unset."""
+    root, database, _ = initialize(tmp_path)
+    conn = connect(database)
+    try:
+        repositories = Repositories(conn)
+        session_id = repositories.create_collection_session(CollectionSessionPlan(
+            display_name="protocol-three controller test", planned_trials=1, random_seed=3,
+        ))
+        repositories.transition_collection_session(session_id, "active")
+    finally:
+        conn.close()
 
-
-def test_capture_timer_activates_target_when_qt_presentation_callback_is_missing(qtbot, tmp_path) -> None:
-    """A visible target must not remain unclickable when frameSwapped is omitted."""
-    controller = CollectionController(tmp_path, tmp_path / "mouselearn.sqlite3")
+    controller = CollectionController(root, database)
     controller._state = "active"
+    controller._session_id = session_id
+    controller._window = _Window()
     controller._capture = _Capture()
-    controller._writer = _Writer()
-    controller._pending_target = object()
-    controller._target_activation_deadline_ns = 0
-    controller._activate_presented_target = Mock()  # type: ignore[method-assign]
+    controller._canvas_width = 1280
+    controller._canvas_height = 720
+    controller._scheduler = ContinuousUniformTargetScheduler(3)
 
-    controller._drain_capture()
+    controller._begin_trial()
 
-    controller._activate_presented_target.assert_called_once_with("presentation_fallback")
+    assert controller.targetVisible
+    assert controller._trial_id
+    conn = connect(database)
+    try:
+        assert conn.execute("SELECT count(*) FROM trials WHERE session_id=?", (session_id,)).fetchone()[0] == 1
+    finally:
+        conn.close()

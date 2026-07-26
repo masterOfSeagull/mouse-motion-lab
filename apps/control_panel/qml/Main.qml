@@ -308,7 +308,6 @@ ApplicationWindow {
         onClosing: function(close) {
             if (collectionPage.collector.state === "active") {
                 close.accepted = false
-                appController.stopCollection()
             }
         }
 
@@ -341,7 +340,7 @@ ApplicationWindow {
                 anchors.top: parent.top
                 anchors.horizontalCenter: parent.horizontalCenter
                 anchors.topMargin: 28
-                text: "Click the green target. Esc stops and saves the session."
+                text: "Click the green target. Press Esc to stop and save the session."
                 color: "#d1d5db"
                 font.pixelSize: 16
             }
@@ -352,13 +351,6 @@ ApplicationWindow {
                 text: "Trial " + (collectionPage.collector.completedTrials + 1) + " / " + collectionPage.collector.plannedTrials
                 color: "#d1d5db"
                 font.pixelSize: 16
-            }
-            Button {
-                anchors.top: parent.top
-                anchors.right: parent.right
-                anchors.margins: 22
-                text: "Stop and save"
-                onClicked: appController.stopCollection()
             }
             Label {
                 anchors.centerIn: parent
