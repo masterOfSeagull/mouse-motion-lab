@@ -45,19 +45,29 @@ class JobController(QObject):
 
     @Slot()
     def startDiagnostic(self) -> None:
+        self._start_worker("diagnostic", ["diagnostic"], "Starting diagnostic worker…")
+
+    @Slot(str)
+    def startPreprocessing(self, snapshot_id: str) -> None:
+        if not snapshot_id:
+            self._set_message("Select a ready dataset snapshot first")
+            return
+        self._start_worker("preprocess", ["preprocess", "--snapshot-id", snapshot_id], "Starting preprocessing worker…")
+
+    def _start_worker(self, job_type: str, command: list[str], message: str) -> None:
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             self._set_message("A job is already running")
             return
         conn, repos = self._repositories()
         try:
-            self._job_id = repos.create_job("diagnostic")
+            self._job_id = repos.create_job(job_type)
         finally:
             conn.close()
         self.jobChanged.emit()
         self._cancellation_requested = False
         process = self.process = QProcess(self)
         process.setProgram(sys.executable)
-        process.setArguments(["-m", "apps.worker", "diagnostic", "--job-id", self._job_id])
+        process.setArguments(["-m", "apps.worker", *command, "--job-id", self._job_id])
         environment = QProcessEnvironment.systemEnvironment()
         environment.insert("MOUSE_MOTION_LAB_DATA_ROOT", str(self.database.parent))
         environment.insert("PYTHONUNBUFFERED", "1")
@@ -66,7 +76,7 @@ class JobController(QObject):
         process.readyReadStandardError.connect(self._read_stderr)
         process.finished.connect(self._finished)
         process.errorOccurred.connect(self._process_error)
-        self._set_message("Starting diagnostic worker…")
+        self._set_message(message)
         process.start()
 
     @Slot()
@@ -146,8 +156,9 @@ class AppController(QObject):
         self.jobs = JobController(database, self)
         self.collection = CollectionController(root, database, self)
         self.review = ReviewController(root, database, self)
-        self.datasets = DatasetController(root, database, self)
+        self.datasets = DatasetController(root, database, self.jobs.startPreprocessing, self)
         self.jobs.jobChanged.connect(self.refresh)
+        self.jobs.jobChanged.connect(self.datasets.refresh)
         self.jobs.messageChanged.connect(self.jobChanged)
         self.collection.stateChanged.connect(self.review.refresh)
         self.collection.stateChanged.connect(self.datasets.refresh)

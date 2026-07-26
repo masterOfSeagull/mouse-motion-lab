@@ -7,6 +7,7 @@ import time
 from pathlib import Path
 
 from mouselearn.diagnostics.checks import database_check, display_check, environment_checks, filesystem_check
+from mouselearn.preprocessing import preprocess_dataset_snapshot
 from mouselearn.domain.events import WorkerEvent
 from mouselearn.storage.database import connect, migrate
 from mouselearn.storage.paths import database_path, data_root, initialize_data_root
@@ -59,6 +60,35 @@ def run_diagnostic(job_id: str, root: Path | None = None) -> int:
             _persist_then_emit(Repositories(conn), WorkerEvent(event="failed", job_id=job_id, message=str(exc)))
         except Exception:
             logger.exception("could not persist failure")
+        return 1
+    finally:
+        conn.close()
+
+
+def run_preprocessing(job_id: str, snapshot_id: str, root: Path | None = None) -> int:
+    """Run representation construction in a worker process, never on the GUI thread."""
+    root = initialize_data_root(root or data_root())
+    conn = connect(database_path(root))
+    logger = logging.getLogger("mousemotionlab.worker")
+    try:
+        migrate(conn)
+        repos = Repositories(conn)
+        _persist_then_emit(repos, WorkerEvent(event="started", job_id=job_id, message="Preprocessing started"))
+        _persist_then_emit(repos, WorkerEvent(event="stage_changed", job_id=job_id, stage="verifying"))
+        _persist_then_emit(repos, WorkerEvent(event="progress", job_id=job_id, stage="verifying", progress=10))
+        _persist_then_emit(repos, WorkerEvent(event="stage_changed", job_id=job_id, stage="representing"))
+        result = preprocess_dataset_snapshot(root, database_path(root), snapshot_id)
+        _persist_then_emit(repos, WorkerEvent(event="metric", job_id=job_id, stage="representing", name="processed_trials", value=result["processed_trial_count"]))
+        _persist_then_emit(repos, WorkerEvent(event="metric", job_id=job_id, stage="representing", name="reconstruction_max_error", value=result["reconstruction"]["max_error"]))
+        _persist_then_emit(repos, WorkerEvent(event="progress", job_id=job_id, stage="representing", progress=95))
+        _persist_then_emit(repos, WorkerEvent(event="completed", job_id=job_id, message=f"Preprocessing complete: {result['processed_trial_count']} trials"))
+        return 0
+    except Exception as exc:
+        logger.exception("preprocessing worker failed")
+        try:
+            _persist_then_emit(Repositories(conn), WorkerEvent(event="failed", job_id=job_id, message=str(exc)))
+        except Exception:
+            logger.exception("could not persist preprocessing failure")
         return 1
     finally:
         conn.close()

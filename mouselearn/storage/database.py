@@ -222,6 +222,27 @@ DROP TABLE collection_phase_markers;
 ALTER TABLE collection_phase_markers_next RENAME TO collection_phase_markers;
 CREATE INDEX idx_collection_phase_markers_trial ON collection_phase_markers(trial_id, timestamp_ns);
 CREATE INDEX idx_collection_phase_markers_session ON collection_phase_markers(session_id, timestamp_ns);
+"""), (7, """
+CREATE TABLE preprocessing_run_details (
+  run_id TEXT PRIMARY KEY REFERENCES preprocessing_runs(id) ON DELETE CASCADE,
+  snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+  config_json TEXT NOT NULL,
+  code_revision TEXT NOT NULL,
+  processed_relative_path TEXT,
+  processed_sha256 TEXT,
+  report_relative_path TEXT,
+  report_sha256 TEXT,
+  processed_trial_count INTEGER NOT NULL DEFAULT 0 CHECK(processed_trial_count >= 0),
+  skipped_trial_count INTEGER NOT NULL DEFAULT 0 CHECK(skipped_trial_count >= 0),
+  error TEXT,
+  started_at TEXT,
+  finished_at TEXT,
+  CHECK((processed_relative_path IS NULL AND processed_sha256 IS NULL) OR
+        (processed_relative_path IS NOT NULL AND length(processed_sha256) = 64)),
+  CHECK((report_relative_path IS NULL AND report_sha256 IS NULL) OR
+        (report_relative_path IS NOT NULL AND length(report_sha256) = 64))
+);
+CREATE INDEX idx_preprocessing_run_details_snapshot ON preprocessing_run_details(snapshot_id, run_id);
 """),)
 
 

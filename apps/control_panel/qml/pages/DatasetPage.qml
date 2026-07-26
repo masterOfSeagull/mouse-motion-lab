@@ -16,7 +16,7 @@ Item {
             Button { text: "Refresh"; onClicked: datasetPage.datasetController.refresh() }
         }
         Label {
-            text: "Snapshots are immutable manifests of retained sessions and valid-click trials. The default split keeps each session entirely in one split."
+            text: "Snapshots are immutable manifests. Build uses retained current-protocol sessions only; each session stays entirely in one split."
             wrapMode: Text.Wrap
             Layout.fillWidth: true
         }
@@ -27,6 +27,17 @@ Item {
             Button { text: "Build snapshot"; onClicked: datasetPage.datasetController.buildSnapshot(snapshotName.text) }
         }
         Label { text: datasetPage.datasetController.message; color: "#4b5563"; wrapMode: Text.Wrap; Layout.fillWidth: true }
+        Label {
+            Layout.fillWidth: true
+            visible: datasetPage.datasetController.preprocessingRuns.length > 0
+            text: {
+                var run = datasetPage.datasetController.preprocessingRuns[0]
+                var reconstruction = run.reconstruction_max_error === undefined || run.reconstruction_max_error === null ? "" : " • max error " + Number(run.reconstruction_max_error).toFixed(4)
+                return "Latest representation: " + run.status + " • " + run.processed_trial_count + " processed • " + run.skipped_trial_count + " skipped" + reconstruction
+            }
+            color: datasetPage.datasetController.preprocessingRuns.length && datasetPage.datasetController.preprocessingRuns[0].status === "completed" ? "#047857" : "#b45309"
+            wrapMode: Text.Wrap
+        }
         Rectangle {
             Layout.fillWidth: true
             Layout.fillHeight: true
@@ -44,7 +55,7 @@ Item {
                 delegate: Rectangle {
                     required property var modelData
                     width: ListView.view.width
-                    height: 76
+                    height: 106
                     radius: 5
                     color: "#f9fafb"
                     border.color: "#d1d5db"
@@ -52,6 +63,7 @@ Item {
                         anchors.fill: parent
                         anchors.margins: 9
                         spacing: 3
+                        Button { text: "Preprocess"; onClicked: datasetPage.datasetController.preprocessSnapshot(modelData.id) }
                         Text { text: modelData.name + " — " + modelData.status; font.bold: true; width: parent.width; elide: Text.ElideRight }
                         Text { text: modelData.trial_count + " trials · " + modelData.session_count + " sessions · " + modelData.id.slice(0, 8); color: "#4b5563" }
                         Text { text: modelData.warnings.length ? modelData.warnings.join(" ") : "Session-held-out split ready"; color: modelData.warnings.length ? "#b45309" : "#047857"; width: parent.width; elide: Text.ElideRight }

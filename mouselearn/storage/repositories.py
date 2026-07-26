@@ -416,6 +416,17 @@ class Repositories:
         ).fetchall()
         return [dict(row) for row in rows]
 
+    def current_protocol_dataset_sessions(self) -> list[dict[str, Any]]:
+        """Eligible sessions collected with the post-presentation protocol only."""
+        current: list[dict[str, Any]] = []
+        for session in self.eligible_dataset_sessions():
+            row = self.conn.execute(
+                "SELECT classification FROM collection_session_quality WHERE session_id=?", (session["id"],)
+            ).fetchone()
+            if row is not None and row[0] == "current":
+                current.append(session)
+        return current
+
     def create_dataset_snapshot_draft(self, plan: DatasetSnapshotPlan, code_revision: str) -> dict[str, Any]:
         """Persist all immutable source choices while the manifest is being written."""
         eligible = self.eligible_dataset_sessions()
@@ -586,3 +597,66 @@ class Repositories:
             item["warnings"] = json.loads(item.pop("warnings_json"))
             results.append(item)
         return results
+
+    def create_preprocessing_run(self, snapshot_id: str, config: dict[str, Any], code_revision: str) -> str:
+        if self.conn.execute("SELECT 1 FROM dataset_snapshots WHERE id=? AND status='ready'", (snapshot_id,)).fetchone() is None:
+            raise ValueError("preprocessing requires a ready dataset snapshot")
+        run_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO preprocessing_runs(id,status,created_at) VALUES(?,?,?)", (run_id, "queued", now),
+            )
+            self.conn.execute(
+                """INSERT INTO preprocessing_run_details(run_id,snapshot_id,config_json,code_revision,started_at)
+                   VALUES(?,?,?,?,?)""",
+                (run_id, snapshot_id, json.dumps(config, sort_keys=True), code_revision, now),
+            )
+            self.audit("preprocessing_run", run_id, "queued", {"snapshot_id": snapshot_id, "config": config})
+        return run_id
+
+    def complete_preprocessing_run(
+        self, run_id: str, processed_relative_path: str, processed_sha256: str,
+        report_relative_path: str, report_sha256: str, processed_trial_count: int, skipped_trial_count: int,
+    ) -> None:
+        now = utcnow()
+        with self.conn:
+            updated = self.conn.execute(
+                """UPDATE preprocessing_run_details SET processed_relative_path=?, processed_sha256=?,
+                       report_relative_path=?, report_sha256=?, processed_trial_count=?, skipped_trial_count=?,
+                       finished_at=? WHERE run_id=?""",
+                (processed_relative_path, processed_sha256, report_relative_path, report_sha256,
+                 processed_trial_count, skipped_trial_count, now, run_id),
+            ).rowcount
+            if updated != 1:
+                raise KeyError(run_id)
+            updated = self.conn.execute(
+                "UPDATE preprocessing_runs SET status='completed' WHERE id=? AND status IN ('queued','running')", (run_id,),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError("preprocessing run was not queued or running")
+            self.audit("preprocessing_run", run_id, "completed", {"processed_trial_count": processed_trial_count, "skipped_trial_count": skipped_trial_count})
+
+    def start_preprocessing_run(self, run_id: str) -> None:
+        with self.conn:
+            updated = self.conn.execute(
+                "UPDATE preprocessing_runs SET status='running' WHERE id=? AND status='queued'", (run_id,),
+            ).rowcount
+            if updated != 1:
+                raise RuntimeError("preprocessing run was not queued")
+            self.audit("preprocessing_run", run_id, "started")
+
+    def fail_preprocessing_run(self, run_id: str, error: str) -> None:
+        now = utcnow()
+        with self.conn:
+            self.conn.execute("UPDATE preprocessing_runs SET status='failed' WHERE id=? AND status IN ('queued','running')", (run_id,))
+            self.conn.execute("UPDATE preprocessing_run_details SET error=?, finished_at=? WHERE run_id=?", (error[:4000], now, run_id))
+            self.audit("preprocessing_run", run_id, "failed", {"error": error[:4000]})
+
+    def preprocessing_runs(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT r.id,r.status,r.created_at,d.snapshot_id,d.processed_relative_path,d.report_relative_path,
+                      d.processed_trial_count,d.skipped_trial_count,d.error,d.finished_at
+                 FROM preprocessing_runs r JOIN preprocessing_run_details d ON d.run_id=r.id
+                 ORDER BY r.created_at DESC"""
+        ).fetchall()
+        return [dict(row) for row in rows]

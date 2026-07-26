@@ -21,14 +21,14 @@ from mouselearn.storage.repositories import Repositories
 
 def test_first_run_and_migrations_are_idempotent(data_root) -> None:
     root, db, version = initialize(data_root)
-    assert version == 6
+    assert version == 7
     assert db == root / "app.db"
     assert all((root / name).is_dir() for name in (
         "logs", "raw_sessions", "datasets", "experiments", "models", "exports", "cache", "temp",
     ))
     conn = connect(db)
     try:
-        assert migrate(conn) == 6
+        assert migrate(conn) == 7
         assert conn.execute("PRAGMA integrity_check").fetchone()[0] == "ok"
     finally:
         conn.close()
@@ -41,11 +41,12 @@ def test_migration_four_upgrades_a_version_one_database(data_root) -> None:
         conn.executescript(MIGRATIONS[0][1])
         conn.execute("CREATE TABLE schema_migrations (version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)")
         conn.execute("INSERT INTO schema_migrations(version, applied_at) VALUES(1, '2026-07-26T00:00:00+00:00')")
-        assert migrate(conn) == 6
+        assert migrate(conn) == 7
         assert conn.execute("SELECT count(*) FROM pragma_table_info('raw_event_files')").fetchone()[0] > 0
         assert conn.execute("SELECT count(*) FROM pragma_table_info('trial_reviews')").fetchone()[0] > 0
         assert conn.execute("SELECT count(*) FROM pragma_table_info('collection_phase_markers')").fetchone()[0] > 0
         assert conn.execute("SELECT count(*) FROM pragma_table_info('dataset_snapshot_details')").fetchone()[0] > 0
+        assert conn.execute("SELECT count(*) FROM pragma_table_info('preprocessing_run_details')").fetchone()[0] > 0
     finally:
         conn.close()
 
