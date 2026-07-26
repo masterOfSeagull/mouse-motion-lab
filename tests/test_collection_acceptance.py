@@ -62,6 +62,7 @@ def test_synthetic_500_trial_session_persists_without_loss(data_root) -> None:
                     target_x=target.x, target_y=target.y, monitor_id="synthetic",
                     requested_radius_px=target.requested_radius_px,
                     collection_protocol_version=3, target_sampling_strategy=target.sampling_strategy,
+                    reaction_time_confidence="presentation_fallback",
                 ),
                 target_appeared_ns=appeared, start_screen_x=640, start_screen_y=360,
             ))

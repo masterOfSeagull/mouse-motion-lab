@@ -107,6 +107,9 @@ class CollectionController(QObject):
         self._trial_timeout = QTimer(self)
         self._trial_timeout.setSingleShot(True)
         self._trial_timeout.timeout.connect(self._on_trial_timeout)
+        self._presentation_fallback = QTimer(self)
+        self._presentation_fallback.setSingleShot(True)
+        self._presentation_fallback.timeout.connect(self._on_presentation_fallback)
 
     def _availability_message(self) -> str:
         if native_library_path() is None:
@@ -208,6 +211,7 @@ class CollectionController(QObject):
                         "collection_protocol_version": 3, "target_sampling_strategy": "continuous_uniform_feasible_v3",
                         "target_radius_logical_px": [12, 36], "target_edge_margin_logical_px": 12,
                         "inter_trial_delay_ms": [400, 1200],
+                        "target_presentation_fallback_ms": 120,
                         "trial_timeout_ms": 15_000, "writer_queue_batches": 64, "parquet_row_group_events": 4096,
                     },
                     environment={"native_library": str(self._capture.path)},
@@ -293,6 +297,9 @@ class CollectionController(QObject):
             self._target_visible = True
             self._pending_target = target
             self._targetChanged()
+            # `frameSwapped` is authoritative. Some Windows/Qt render paths do not emit it for this window,
+            # so a bounded fallback prevents a visible target from becoming an unclickable dead state.
+            self._presentation_fallback.start(120)
         except (NativeCaptureError, RuntimeError, ValueError) as exc:
             self._fail(f"Could not create trial: {exc}")
             return
@@ -310,8 +317,16 @@ class CollectionController(QObject):
 
     def _on_frame_swapped(self) -> None:
         """Only now is the target visibly presented and eligible for reaction timing/clicks."""
+        self._activate_presented_target("high")
+
+    def _on_presentation_fallback(self) -> None:
+        """Mark a visible target active when Qt omitted frameSwapped; reaction timing remains lower confidence."""
+        self._activate_presented_target("presentation_fallback")
+
+    def _activate_presented_target(self, reaction_time_confidence: str) -> None:
         if self._state != "active" or self._finishing or self._pending_target is None or self._capture is None:
             return
+        self._presentation_fallback.stop()
         target = self._pending_target
         try:
             timestamp_ns, start_screen_x, start_screen_y = self._capture_timestamp_and_cursor()
@@ -328,7 +343,7 @@ class CollectionController(QObject):
                 requested_angle_degrees=target.requested_angle_degrees,
                 requested_screen_region=target.requested_screen_region, requested_corner=target.requested_corner,
                 realized_corner=target.realized_corner, collection_protocol_version=3,
-                target_sampling_strategy=target.sampling_strategy, reaction_time_confidence="high",
+                target_sampling_strategy=target.sampling_strategy, reaction_time_confidence=reaction_time_confidence,
             )
             conn, repos = self._repositories()
             try:
@@ -496,6 +511,7 @@ class CollectionController(QObject):
         self._finishing = True
         self._timer.stop()
         self._trial_timeout.stop()
+        self._presentation_fallback.stop()
         self._target_visible = False
         self._pending_target = None
         self._targetChanged()
