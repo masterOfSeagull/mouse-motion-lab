@@ -9,24 +9,45 @@ ApplicationWindow {
     id: window
     width: 980
     height: 620
+    minimumWidth: 720
+    minimumHeight: 450
     visible: true
     title: "MouseMotionLab"
     color: "#f3f4f6"
     font.family: "Segoe UI"
     font.pixelSize: 14
 
+    readonly property real designWidth: 1180
+    readonly property real designHeight: 700
+    readonly property real uiScale: Math.max(
+        0.6,
+        Math.min(1.6, width / designWidth, height / designHeight)
+    )
     property int currentPage: 0
-    RowLayout {
+
+    Item {
+        id: scaledViewport
         anchors.fill: parent
-        spacing: 0
-        Components.Sidebar {
-            Layout.fillHeight: true
-            Layout.preferredWidth: 210
-            currentPage: window.currentPage
-            onPageSelected: function(page) { window.currentPage = page }
-        }
-        StackLayout {
-            Layout.fillWidth: true; Layout.fillHeight: true; currentIndex: currentPage
+        clip: true
+
+        Item {
+            id: designSurface
+            width: scaledViewport.width / window.uiScale
+            height: scaledViewport.height / window.uiScale
+            scale: window.uiScale
+            transformOrigin: Item.TopLeft
+
+            RowLayout {
+                anchors.fill: parent
+                spacing: 0
+                Components.Sidebar {
+                    Layout.fillHeight: true
+                    Layout.preferredWidth: 210
+                    currentPage: window.currentPage
+                    onPageSelected: function(page) { window.currentPage = page }
+                }
+                StackLayout {
+                    Layout.fillWidth: true; Layout.fillHeight: true; currentIndex: currentPage
             Item {
                 Column { anchors.fill: parent; anchors.margins: 34; spacing: 14
                     Label { text: "Dashboard"; font.pixelSize: 28; font.bold: true }
@@ -288,6 +309,17 @@ ApplicationWindow {
                 }
             }
             Pages.DatasetPage { datasetController: appController.datasetController }
+            Pages.GeneratorPage {
+                generatorController: appController.generatorController
+                datasetController: appController.datasetController
+            }
+            Pages.ExperimentsPage {
+                trainingController: appController.trainingController
+                datasetController: appController.datasetController
+            }
+                    Pages.ModelsPage { registryController: appController.registryController }
+                }
+            }
         }
     }
 

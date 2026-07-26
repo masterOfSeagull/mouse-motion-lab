@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "mouse-motion-lab"
 version = "0.1.0"
-description = "Foundation control panel and diagnostics for MouseMotionLab"
+description = "Personalized mouse-trajectory collection, modeling, and local generation research tool"
 readme = "README.md"
 requires-python = ">=3.12,<3.13"
 license = {text = "MIT"}
@@ -21,7 +21,7 @@ dependencies = [
 [project.optional-dependencies]
 dev = ["pytest>=8,<9", "pytest-qt>=4.4,<5", "pyarrow>=17,<21"]
 collection = ["pyarrow>=17,<21"]
-training = ["torch>=2.6,<2.7", "onnxruntime>=1.21,<1.22"]
+training = ["torch>=2.6,<2.7", "onnx>=1.17,<1.18", "onnxruntime>=1.21,<1.22"]
 
 [project.scripts]
 mousemotionlab = "apps.control_panel.main:main"

@@ -8,4 +8,4 @@ if (-not (Get-Command py -ErrorAction SilentlyContinue)) { throw 'Install Python
 if ($LASTEXITCODE -ne 0) { throw 'Python 3.12 is required; install it or make py -3.12 available.' }
 if (-not (Test-Path "$ProjectRoot\.venv\Scripts\python.exe")) { & py -3.12 -m venv "$ProjectRoot\.venv" }
 & "$ProjectRoot\.venv\Scripts\python.exe" -m pip install --upgrade pip
-& "$ProjectRoot\.venv\Scripts\python.exe" -m pip install -e "$ProjectRoot[dev]"
+& "$ProjectRoot\.venv\Scripts\python.exe" -m pip install -e "$ProjectRoot[dev,training]"

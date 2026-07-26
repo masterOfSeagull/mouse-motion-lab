@@ -29,6 +29,7 @@ def main(argv: list[str] | None = None) -> int:
     root, database, schema_version = initialize()
     configure_json_logging(root / "logs" / "control-panel.jsonl")
     controller = AppController(root, database, schema_version)
+    app.aboutToQuit.connect(controller.playback.shutdown)
     engine = QQmlApplicationEngine()
     engine.rootContext().setContextProperty("appController", controller)
     qml = Path(__file__).parent / "qml" / "Main.qml"

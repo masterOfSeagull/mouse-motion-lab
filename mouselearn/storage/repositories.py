@@ -693,3 +693,225 @@ class Repositories:
                  ORDER BY r.created_at DESC"""
         ).fetchall()
         return [dict(row) for row in rows]
+
+    def create_baseline_model_draft(
+        self, name: str, model_type: str, snapshot_id: str, preprocessing_run_id: str,
+        config: dict[str, Any], code_revision: str,
+    ) -> str:
+        if model_type not in {"retrieval", "pca_mixture"}:
+            raise ValueError("unsupported baseline model type")
+        run = self.conn.execute(
+            """SELECT r.status,d.snapshot_id FROM preprocessing_runs r
+                 JOIN preprocessing_run_details d ON d.run_id=r.id WHERE r.id=?""", (preprocessing_run_id,),
+        ).fetchone()
+        if run is None or run["status"] != "completed" or run["snapshot_id"] != snapshot_id:
+            raise ValueError("baseline model requires a completed preprocessing run for its snapshot")
+        model_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO models(id,name,status,is_default,created_at) VALUES(?,?,?,?,?)",
+                (model_id, name, "draft", 0, now),
+            )
+            self.conn.execute(
+                """INSERT INTO model_details(model_id,model_type,dataset_snapshot_id,preprocessing_run_id,config_json,code_revision)
+                   VALUES(?,?,?,?,?,?)""",
+                (model_id, model_type, snapshot_id, preprocessing_run_id, json.dumps(config, sort_keys=True), code_revision),
+            )
+            self.audit("model", model_id, "draft_created", {"model_type": model_type, "snapshot_id": snapshot_id, "preprocessing_run_id": preprocessing_run_id})
+        return model_id
+
+    def create_flow_model_draft(
+        self, name: str, snapshot_id: str, preprocessing_run_id: str,
+        config: dict[str, Any], code_revision: str,
+    ) -> str:
+        run = self.conn.execute(
+            """SELECT r.status,d.snapshot_id FROM preprocessing_runs r
+                 JOIN preprocessing_run_details d ON d.run_id=r.id WHERE r.id=?""", (preprocessing_run_id,),
+        ).fetchone()
+        if run is None or run["status"] != "completed" or run["snapshot_id"] != snapshot_id:
+            raise ValueError("flow model requires a completed preprocessing run for its snapshot")
+        model_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute("INSERT INTO models(id,name,status,is_default,created_at) VALUES(?,?,?,?,?)", (model_id, name, "draft", 0, now))
+            self.conn.execute(
+                """INSERT INTO model_details(model_id,model_type,dataset_snapshot_id,preprocessing_run_id,config_json,code_revision)
+                   VALUES(?,?,?,?,?,?)""",
+                (model_id, "conditional_flow", snapshot_id, preprocessing_run_id, json.dumps(config, sort_keys=True), code_revision),
+            )
+            self.audit("model", model_id, "draft_created", {"model_type": "conditional_flow", "snapshot_id": snapshot_id})
+        return model_id
+
+    def create_experiment(
+        self, name: str, snapshot_id: str, preprocessing_run_id: str, config: dict[str, Any], random_seed: int,
+        job_id: str | None = None,
+    ) -> str:
+        experiment_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                """INSERT INTO experiments(id,name,status,dataset_snapshot_id,preprocessing_run_id,config_json,random_seed,created_at,job_id)
+                   VALUES(?,?,?,?,?,?,?,?,?)""",
+                (experiment_id, name, "queued", snapshot_id, preprocessing_run_id, json.dumps(config, sort_keys=True), random_seed, now, job_id),
+            )
+            self.audit("experiment", experiment_id, "queued", {"snapshot_id": snapshot_id, "preprocessing_run_id": preprocessing_run_id})
+        return experiment_id
+
+    def start_experiment(self, experiment_id: str) -> None:
+        with self.conn:
+            if self.conn.execute(
+                "UPDATE experiments SET status='running',started_at=? WHERE id=? AND status='queued'", (utcnow(), experiment_id),
+            ).rowcount != 1:
+                raise RuntimeError("experiment was not queued")
+            self.audit("experiment", experiment_id, "started")
+
+    def update_experiment_metrics(
+        self, experiment_id: str, epoch: int, metrics: dict[str, Any], checkpoint_relative_path: str | None = None,
+    ) -> None:
+        with self.conn:
+            self.conn.execute(
+                """UPDATE experiments SET latest_epoch=?,latest_metrics_json=?,best_validation_loss=?,
+                          checkpoint_relative_path=COALESCE(?,checkpoint_relative_path) WHERE id=? AND status='running'""",
+                (epoch, json.dumps(metrics, sort_keys=True), metrics.get("best_validation_loss"), checkpoint_relative_path, experiment_id),
+            )
+
+    def complete_experiment(self, experiment_id: str, model_id: str) -> None:
+        with self.conn:
+            if self.conn.execute(
+                "UPDATE experiments SET status='completed',model_id=?,finished_at=? WHERE id=? AND status='running'",
+                (model_id, utcnow(), experiment_id),
+            ).rowcount != 1:
+                raise RuntimeError("experiment was not running")
+            self.audit("experiment", experiment_id, "completed", {"model_id": model_id})
+
+    def fail_experiment(self, experiment_id: str, error: str) -> None:
+        with self.conn:
+            self.conn.execute(
+                "UPDATE experiments SET status='failed',error=?,finished_at=? WHERE id=? AND status IN ('queued','running')",
+                (error[:4000], utcnow(), experiment_id),
+            )
+            self.audit("experiment", experiment_id, "failed", {"error": error[:4000]})
+
+    def cancel_experiments_for_job(self, job_id: str) -> None:
+        now = utcnow()
+        with self.conn:
+            rows = self.conn.execute(
+                "SELECT id FROM experiments WHERE job_id=? AND status IN ('queued','running')", (job_id,),
+            ).fetchall()
+            self.conn.execute(
+                """UPDATE experiments SET status='cancelled',error='Cancelled by user',finished_at=?
+                   WHERE job_id=? AND status IN ('queued','running')""", (now, job_id),
+            )
+            for row in rows:
+                self.audit("experiment", row[0], "cancelled", {"job_id": job_id})
+
+    def experiments(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute("SELECT * FROM experiments ORDER BY created_at DESC").fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["config"] = json.loads(item.pop("config_json"))
+            item["latest_metrics"] = json.loads(item.pop("latest_metrics_json"))
+            result.append(item)
+        return result
+
+    def finalize_baseline_model(
+        self, model_id: str, manifest_relative_path: str, manifest_sha256: str,
+        validation_relative_path: str, validation_sha256: str,
+    ) -> None:
+        for path in (manifest_relative_path, validation_relative_path):
+            if not path or path.startswith("/") or ".." in path.replace("\\", "/").split("/"):
+                raise ValueError("model artifact paths must be safe and relative")
+        if len(manifest_sha256) != 64 or len(validation_sha256) != 64:
+            raise ValueError("model artifact digests must be SHA-256 values")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            updated = self.conn.execute(
+                """UPDATE model_details SET manifest_relative_path=?,manifest_sha256=?,
+                          validation_relative_path=?,validation_sha256=?,error=NULL WHERE model_id=?""",
+                (manifest_relative_path.replace("\\", "/"), manifest_sha256,
+                 validation_relative_path.replace("\\", "/"), validation_sha256, model_id),
+            ).rowcount
+            status_updated = self.conn.execute(
+                "UPDATE models SET status='ready' WHERE id=? AND status='draft'", (model_id,),
+            ).rowcount
+            if updated != 1 or status_updated != 1:
+                raise RuntimeError("baseline model was not a valid draft")
+            self.audit("model", model_id, "ready", {"validation_sha256": validation_sha256})
+            self.conn.execute(
+                """INSERT INTO model_registry(model_id,lifecycle,validation_sha256,updated_at) VALUES(?,?,?,?)
+                   ON CONFLICT(model_id) DO UPDATE SET lifecycle=excluded.lifecycle,
+                     validation_sha256=excluded.validation_sha256,updated_at=excluded.updated_at""",
+                (model_id, "validated", validation_sha256, utcnow()),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def discard_baseline_model_draft(self, model_id: str, error: str) -> None:
+        with self.conn:
+            row = self.conn.execute("SELECT status FROM models WHERE id=?", (model_id,)).fetchone()
+            if row is None:
+                return
+            if row[0] != "draft":
+                raise RuntimeError("only draft models can be discarded")
+            self.audit("model", model_id, "draft_discarded", {"error": error[:4000]})
+            self.conn.execute("DELETE FROM models WHERE id=?", (model_id,))
+
+    def baseline_models(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT m.id,m.name,m.status,m.created_at,d.model_type,d.dataset_snapshot_id,d.preprocessing_run_id,
+                      d.config_json,d.code_revision,d.manifest_relative_path,d.manifest_sha256,
+                      d.validation_relative_path,d.validation_sha256,d.error
+                 FROM models m JOIN model_details d ON d.model_id=m.id
+                 ORDER BY m.created_at DESC"""
+        ).fetchall()
+        result = []
+        for row in rows:
+            item = dict(row)
+            item["config"] = json.loads(item.pop("config_json"))
+            result.append(item)
+        return result
+
+    def baseline_model(self, model_id: str) -> dict[str, Any]:
+        for model in self.baseline_models():
+            if model["id"] == model_id:
+                return model
+        raise KeyError(model_id)
+
+    def registry_models(self) -> list[dict[str, Any]]:
+        models = self.baseline_models()
+        registry = {row["model_id"]: dict(row) for row in self.conn.execute("SELECT * FROM model_registry")}
+        for model in models:
+            entry = registry.get(model["id"], {})
+            model["lifecycle"] = entry.get("lifecycle", "candidate")
+            model["registry_validation_sha256"] = entry.get("validation_sha256")
+        return models
+
+    def promote_validated_model(self, model_id: str, validation_sha256: str) -> None:
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = self.conn.execute(
+                """SELECT r.lifecycle,r.validation_sha256,m.status FROM model_registry r
+                   JOIN models m ON m.id=r.model_id WHERE r.model_id=?""", (model_id,),
+            ).fetchone()
+            if row is None or row["lifecycle"] not in {"validated", "active"} or row["status"] != "ready":
+                raise ValueError("only a validated ready model can be promoted")
+            if row["validation_sha256"] != validation_sha256:
+                raise ValueError("validation digest does not match the registry gate")
+            now = utcnow()
+            self.conn.execute("UPDATE model_registry SET lifecycle='validated',updated_at=? WHERE lifecycle='active' AND model_id<>?", (now, model_id))
+            self.conn.execute("UPDATE model_registry SET lifecycle='active',updated_at=? WHERE model_id=?", (now, model_id))
+            self.audit("model", model_id, "promoted", {"validation_sha256": validation_sha256})
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
+    def deprecate_model(self, model_id: str) -> None:
+        with self.conn:
+            if self.conn.execute(
+                "UPDATE model_registry SET lifecycle='deprecated',updated_at=? WHERE model_id=? AND lifecycle<>'active'",
+                (utcnow(), model_id),
+            ).rowcount != 1:
+                raise ValueError("active models must be replaced before deprecation")
+            self.audit("model", model_id, "deprecated")

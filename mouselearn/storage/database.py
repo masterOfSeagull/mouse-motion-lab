@@ -243,6 +243,75 @@ CREATE TABLE preprocessing_run_details (
         (report_relative_path IS NOT NULL AND length(report_sha256) = 64))
 );
 CREATE INDEX idx_preprocessing_run_details_snapshot ON preprocessing_run_details(snapshot_id, run_id);
+"""), (8, """
+CREATE TABLE model_details (
+  model_id TEXT PRIMARY KEY REFERENCES models(id) ON DELETE CASCADE,
+  model_type TEXT NOT NULL CHECK(model_type IN ('retrieval','pca_mixture')),
+  dataset_snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+  preprocessing_run_id TEXT NOT NULL REFERENCES preprocessing_runs(id) ON DELETE RESTRICT,
+  config_json TEXT NOT NULL,
+  code_revision TEXT NOT NULL,
+  manifest_relative_path TEXT,
+  manifest_sha256 TEXT,
+  validation_relative_path TEXT,
+  validation_sha256 TEXT,
+  error TEXT,
+  CHECK((manifest_relative_path IS NULL AND manifest_sha256 IS NULL) OR
+        (manifest_relative_path IS NOT NULL AND length(manifest_sha256) = 64)),
+  CHECK((validation_relative_path IS NULL AND validation_sha256 IS NULL) OR
+        (validation_relative_path IS NOT NULL AND length(validation_sha256) = 64))
+);
+CREATE INDEX idx_model_details_preprocessing_run ON model_details(preprocessing_run_id, model_type);
+"""), (9, """
+ALTER TABLE model_details RENAME TO model_details_v8;
+CREATE TABLE model_details (
+  model_id TEXT PRIMARY KEY REFERENCES models(id) ON DELETE CASCADE,
+  model_type TEXT NOT NULL CHECK(model_type IN ('retrieval','pca_mixture','conditional_flow')),
+  dataset_snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+  preprocessing_run_id TEXT NOT NULL REFERENCES preprocessing_runs(id) ON DELETE RESTRICT,
+  config_json TEXT NOT NULL, code_revision TEXT NOT NULL,
+  manifest_relative_path TEXT, manifest_sha256 TEXT,
+  validation_relative_path TEXT, validation_sha256 TEXT, error TEXT,
+  CHECK((manifest_relative_path IS NULL AND manifest_sha256 IS NULL) OR
+        (manifest_relative_path IS NOT NULL AND length(manifest_sha256) = 64)),
+  CHECK((validation_relative_path IS NULL AND validation_sha256 IS NULL) OR
+        (validation_relative_path IS NOT NULL AND length(validation_sha256) = 64))
+);
+INSERT INTO model_details SELECT * FROM model_details_v8;
+DROP TABLE model_details_v8;
+CREATE INDEX idx_model_details_preprocessing_run ON model_details(preprocessing_run_id, model_type);
+CREATE TABLE experiments (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  status TEXT NOT NULL CHECK(status IN ('queued','running','completed','failed','cancelled')),
+  dataset_snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+  preprocessing_run_id TEXT NOT NULL REFERENCES preprocessing_runs(id) ON DELETE RESTRICT,
+  model_id TEXT REFERENCES models(id) ON DELETE SET NULL,
+  config_json TEXT NOT NULL,
+  random_seed INTEGER NOT NULL CHECK(random_seed >= 0),
+  latest_epoch INTEGER NOT NULL DEFAULT 0 CHECK(latest_epoch >= 0),
+  latest_metrics_json TEXT NOT NULL DEFAULT '{}',
+  best_validation_loss REAL,
+  checkpoint_relative_path TEXT,
+  error TEXT,
+  created_at TEXT NOT NULL, started_at TEXT, finished_at TEXT
+);
+CREATE INDEX idx_experiments_status_created ON experiments(status, created_at);
+"""), (10, """
+ALTER TABLE experiments ADD COLUMN job_id TEXT REFERENCES jobs(id) ON DELETE SET NULL;
+CREATE INDEX idx_experiments_job ON experiments(job_id);
+"""), (11, """
+CREATE TABLE model_registry (
+  model_id TEXT PRIMARY KEY REFERENCES models(id) ON DELETE CASCADE,
+  lifecycle TEXT NOT NULL CHECK(lifecycle IN ('candidate','validated','active','deprecated')),
+  validation_sha256 TEXT,
+  updated_at TEXT NOT NULL,
+  CHECK(validation_sha256 IS NULL OR length(validation_sha256) = 64)
+);
+CREATE UNIQUE INDEX one_active_registry_model ON model_registry(lifecycle) WHERE lifecycle='active';
+INSERT INTO model_registry(model_id,lifecycle,validation_sha256,updated_at)
+SELECT m.id,CASE WHEN d.validation_sha256 IS NULL THEN 'candidate' ELSE 'validated' END,d.validation_sha256,CURRENT_TIMESTAMP
+FROM models m JOIN model_details d ON d.model_id=m.id WHERE m.status='ready';
 """),)
 
 

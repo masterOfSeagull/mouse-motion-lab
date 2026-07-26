@@ -40,7 +40,11 @@ def current_code_revision() -> str:
         result = subprocess.run(
             ["git", "rev-parse", "HEAD"], cwd=root, check=True, capture_output=True, text=True, timeout=2,
         )
-        return result.stdout.strip() or "unknown"
+        revision = result.stdout.strip() or "unknown"
+        status = subprocess.run(
+            ["git", "status", "--porcelain"], cwd=root, check=True, capture_output=True, text=True, timeout=2,
+        )
+        return revision + ("+dirty" if status.stdout.strip() else "")
     except (FileNotFoundError, subprocess.SubprocessError):
         return "unknown"
 

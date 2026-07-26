@@ -11,7 +11,11 @@ from mouselearn.domain.events import WorkerEvent, parse_event
 from mouselearn.storage.database import connect, migrate
 from mouselearn.storage.repositories import Repositories
 from mouselearn.ui.datasets import DatasetController
+from mouselearn.ui.generator import GeneratorController
 from mouselearn.ui.review import ReviewController
+from mouselearn.ui.training import TrainingController
+from mouselearn.ui.registry import RegistryController
+from mouselearn.runtime import PlaybackController
 
 
 class JobController(QObject):
@@ -54,6 +58,20 @@ class JobController(QObject):
             return
         self._start_worker("preprocess", ["preprocess", "--snapshot-id", snapshot_id], "Starting preprocessing worker…")
 
+    @Slot(str, str)
+    def startBaseline(self, preprocessing_run_id: str, model_type: str) -> None:
+        self._start_worker(
+            "baseline", ["baseline", "--preprocessing-run-id", preprocessing_run_id, "--model-type", model_type],
+            f"Starting {model_type.replace('_', ' ')} baseline worker…",
+        )
+
+    @Slot(str, str)
+    def startFlowTraining(self, preprocessing_run_id: str, preset: str) -> None:
+        self._start_worker(
+            "conditional_flow", ["flow-train", "--preprocessing-run-id", preprocessing_run_id, "--preset", preset],
+            f"Starting conditional-flow {preset} training worker…",
+        )
+
     def _start_worker(self, job_type: str, command: list[str], message: str) -> None:
         if self.process and self.process.state() != QProcess.ProcessState.NotRunning:
             self._set_message("A job is already running")
@@ -86,6 +104,11 @@ class JobController(QObject):
             self.process.kill()
             self.process.waitForFinished(1500)
             self._set_job_terminal("cancelled", "Cancelled by user")
+            conn, repos = self._repositories()
+            try:
+                repos.cancel_experiments_for_job(self._job_id)
+            finally:
+                conn.close()
 
     def _read_stdout(self) -> None:
         assert self.process is not None
@@ -157,8 +180,16 @@ class AppController(QObject):
         self.collection = CollectionController(root, database, self)
         self.review = ReviewController(root, database, self)
         self.datasets = DatasetController(root, database, self.jobs.startPreprocessing, self)
+        self.generator = GeneratorController(root, database, self.jobs.startBaseline, self)
+        self.training = TrainingController(database, self.jobs.startFlowTraining, self)
+        self.registry = RegistryController(root, database, self)
+        self.playback = PlaybackController(self)
+        self.generator.trajectoryChanged.connect(lambda: self.playback.setTrajectory(self.generator.trajectory))
         self.jobs.jobChanged.connect(self.refresh)
         self.jobs.jobChanged.connect(self.datasets.refresh)
+        self.jobs.jobChanged.connect(self.generator.refresh)
+        self.jobs.jobChanged.connect(self.training.refresh)
+        self.jobs.jobChanged.connect(self.registry.refresh)
         self.jobs.messageChanged.connect(self.jobChanged)
         self.collection.stateChanged.connect(self.review.refresh)
         self.collection.stateChanged.connect(self.datasets.refresh)
@@ -193,6 +224,22 @@ class AppController(QObject):
     def datasetController(self) -> QObject:
         return self.datasets
 
+    @Property(QObject, constant=True)
+    def generatorController(self) -> QObject:
+        return self.generator
+
+    @Property(QObject, constant=True)
+    def trainingController(self) -> QObject:
+        return self.training
+
+    @Property(QObject, constant=True)
+    def registryController(self) -> QObject:
+        return self.registry
+
+    @Property(QObject, constant=True)
+    def playbackController(self) -> QObject:
+        return self.playback
+
     @Slot()
     def refresh(self) -> None:
         conn = connect(self.database)
@@ -214,8 +261,17 @@ class AppController(QObject):
 
     @Slot(QObject, int, int, int, int, int)
     def startCollection(self, window: QObject, planned_trials: int, canvas_x: int, canvas_y: int, canvas_width: int, canvas_height: int) -> None:
+        if self.playback.state != "disarmed":
+            self.playback.disarm()
         self.collection.start(window, planned_trials, canvas_x, canvas_y, canvas_width, canvas_height)
 
     @Slot()
     def stopCollection(self) -> None:
         self.collection.stop()
+
+    @Slot()
+    def startPlayback(self) -> None:
+        if self.collection.state != "idle":
+            self.playback.abort("Playback blocked while collection is active.")
+            return
+        self.playback.start()
