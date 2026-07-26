@@ -475,9 +475,15 @@ class Repositories:
             f"""SELECT t.id, t.session_id
                 FROM trials AS t
                 JOIN recording_sessions AS s ON s.id=t.session_id
+                JOIN collection_session_details AS d ON d.session_id=s.id
                 JOIN trial_details AS td ON td.trial_id=t.id
+                LEFT JOIN collection_session_reviews AS sr ON sr.session_id=s.id
                 LEFT JOIN trial_reviews AS tr ON tr.trial_id=t.id
-                WHERE t.session_id IN ({placeholders}) AND s.status='completed'
+                WHERE t.session_id IN ({placeholders})
+                  AND (
+                       (s.status='completed' AND d.state='completed' AND COALESCE(sr.disposition, 'retained')='retained')
+                    OR (s.status='discarded' AND d.state='cancelled' AND sr.disposition='retained')
+                  )
                   AND t.status='completed' AND td.valid_click_ns IS NOT NULL
                   AND COALESCE(tr.disposition, 'retained')='retained'
                 ORDER BY s.created_at, td.target_appeared_ns, t.id""",

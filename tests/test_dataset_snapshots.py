@@ -15,7 +15,7 @@ from mouselearn.storage.database import connect
 from mouselearn.storage.repositories import Repositories
 
 
-def _completed_session(root, repos: Repositories, index: int) -> str:
+def _completed_session(root, repos: Repositories, index: int, terminal_state: str = "completed") -> str:
     session_id = repos.create_collection_session(CollectionSessionPlan(display_name=f"session {index}", planned_trials=1, random_seed=index))
     repos.transition_collection_session(session_id, "active")
     target = TargetCondition(
@@ -39,7 +39,7 @@ def _completed_session(root, repos: Repositories, index: int) -> str:
         relative_path=f"{session_id}/events.parquet", event_count=1, first_timestamp_ns=1_000,
         last_timestamp_ns=1_100, qpc_frequency_hz=1_000_000, byte_count=len(payload), sha256=hashlib.sha256(payload).hexdigest(),
     ))
-    repos.transition_collection_session(session_id, "completed")
+    repos.transition_collection_session(session_id, terminal_state)
     return session_id
 
 
@@ -84,6 +84,24 @@ def test_session_held_out_uses_the_configured_fractions() -> None:
     assert list(assignments.values()).count("train") == 5
     assert list(assignments.values()).count("validation") == 3
     assert list(assignments.values()).count("test") == 2
+
+
+def test_snapshot_includes_an_explicitly_retained_early_stopped_session(data_root) -> None:
+    root, db, _ = initialize(data_root)
+    conn = connect(db)
+    try:
+        repos = Repositories(conn)
+        completed = _completed_session(root, repos, 1)
+        early_stopped = _completed_session(root, repos, 2, terminal_state="cancelled")
+        repos.set_session_review(early_stopped, "retained", "clean short recording")
+    finally:
+        conn.close()
+
+    snapshot = build_dataset_snapshot(root, db, DatasetSnapshotPlan(name="restored", session_ids=(completed, early_stopped)))
+
+    assert snapshot["trial_count"] == 2
+    assert {row["session_id"] for row in snapshot["splits"]} == {completed, early_stopped}
+    assert any("Explicitly retained early-stopped sessions selected" in warning for warning in snapshot["warnings"])
 
 
 def test_snapshot_failure_cleans_up_its_draft_and_directory(data_root) -> None:
