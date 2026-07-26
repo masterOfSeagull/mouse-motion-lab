@@ -26,7 +26,9 @@ Acceptance is recorded. The deterministic 500-trial synthetic-session acceptance
 
 ### Next: Milestone 3 — Dataset and representation
 
-Implement immutable dataset snapshots, session-held-out splits, canonical transforms, spline and timing representations, reconstruction reports, and the Dataset GUI. Training remains deferred until those representations have deterministic reconstruction and transform-parity tests.
+**Current status (2026-07-26): in progress.** The first slice is implemented: migration 5 adds immutable snapshot metadata, ordered trial membership, and session-level split assignments; retained completed sessions with verified raw-file hashes are eligible. Dataset manifests are written below `datasets/<snapshot-id>/manifest.json`, verified against the referenced raw-file hashes, and then made ready atomically in SQLite. The Dataset page builds and lists those snapshots, with a clear warning when the available session count cannot provide independent validation and test splits. Canonical forward/inverse transforms, valid-by-construction endpoint encoding, clamped cubic spline fitting with fixed endpoints, and monotonic 12-interval timing representations are implemented as pure tested foundations.
+
+The initial real snapshot contains 40 retained valid-click trials from two completed sessions. It is intentionally flagged as non-independent for validation/test purposes; collect at least one additional retained session before treating held-out metrics as meaningful. The next slice will run deterministic preprocessing from a selected snapshot, write the processed representation artifact and reconstruction report, and expose that report in the Dataset page. Training remains deferred until those artifacts have deterministic reconstruction and transform-parity tests.
 
 Milestone 2 was implemented as four testable slices:
 

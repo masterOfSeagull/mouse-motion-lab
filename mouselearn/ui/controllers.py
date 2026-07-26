@@ -10,6 +10,7 @@ from mouselearn.collection.controller import CollectionController
 from mouselearn.domain.events import WorkerEvent, parse_event
 from mouselearn.storage.database import connect, migrate
 from mouselearn.storage.repositories import Repositories
+from mouselearn.ui.datasets import DatasetController
 from mouselearn.ui.review import ReviewController
 
 
@@ -145,9 +146,11 @@ class AppController(QObject):
         self.jobs = JobController(database, self)
         self.collection = CollectionController(root, database, self)
         self.review = ReviewController(root, database, self)
+        self.datasets = DatasetController(root, database, self)
         self.jobs.jobChanged.connect(self.refresh)
         self.jobs.messageChanged.connect(self.jobChanged)
         self.collection.stateChanged.connect(self.review.refresh)
+        self.collection.stateChanged.connect(self.datasets.refresh)
         self._totals: dict[str, int] = {}
         self.refresh()
 
@@ -174,6 +177,10 @@ class AppController(QObject):
     @Property(QObject, constant=True)
     def reviewController(self) -> QObject:
         return self.review
+
+    @Property(QObject, constant=True)
+    def datasetController(self) -> QObject:
+        return self.datasets
 
     @Slot()
     def refresh(self) -> None:

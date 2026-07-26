@@ -143,6 +143,51 @@ CREATE TABLE collection_phase_markers (
 );
 CREATE INDEX idx_collection_phase_markers_trial ON collection_phase_markers(trial_id, timestamp_ns);
 CREATE INDEX idx_collection_phase_markers_session ON collection_phase_markers(session_id, timestamp_ns);
+"""), (5, """
+CREATE TABLE dataset_snapshot_details (
+  snapshot_id TEXT PRIMARY KEY REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+  name TEXT NOT NULL,
+  description TEXT NOT NULL DEFAULT '',
+  ordered_trial_ids_json TEXT NOT NULL,
+  raw_session_hashes_json TEXT NOT NULL,
+  preprocessing_config_json TEXT NOT NULL,
+  split_config_json TEXT NOT NULL,
+  warnings_json TEXT NOT NULL DEFAULT '[]',
+  feature_schema_version INTEGER NOT NULL CHECK(feature_schema_version > 0),
+  code_revision TEXT NOT NULL,
+  manifest_sha256 TEXT,
+  manifest_relative_path TEXT,
+  trial_count INTEGER NOT NULL CHECK(trial_count >= 0),
+  session_count INTEGER NOT NULL CHECK(session_count >= 0),
+  CHECK((manifest_sha256 IS NULL AND manifest_relative_path IS NULL) OR
+        (length(manifest_sha256) = 64 AND manifest_relative_path IS NOT NULL))
+);
+CREATE TABLE dataset_snapshot_trials (
+  snapshot_id TEXT NOT NULL REFERENCES dataset_snapshots(id) ON DELETE RESTRICT,
+  trial_id TEXT NOT NULL REFERENCES trials(id) ON DELETE RESTRICT,
+  session_id TEXT NOT NULL REFERENCES recording_sessions(id) ON DELETE RESTRICT,
+  split TEXT NOT NULL CHECK(split IN ('train','validation','test')),
+  ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+  PRIMARY KEY(snapshot_id, trial_id),
+  UNIQUE(snapshot_id, ordinal)
+);
+CREATE INDEX idx_dataset_snapshot_trials_snapshot_split ON dataset_snapshot_trials(snapshot_id, split, ordinal);
+CREATE TRIGGER dataset_snapshot_details_immutable
+BEFORE UPDATE ON dataset_snapshot_details
+WHEN (SELECT status FROM dataset_snapshots WHERE id=OLD.snapshot_id) = 'ready'
+BEGIN SELECT RAISE(ABORT, 'ready dataset snapshots are immutable'); END;
+CREATE TRIGGER dataset_snapshot_trials_insert_immutable
+BEFORE INSERT ON dataset_snapshot_trials
+WHEN (SELECT status FROM dataset_snapshots WHERE id=NEW.snapshot_id) = 'ready'
+BEGIN SELECT RAISE(ABORT, 'ready dataset snapshots are immutable'); END;
+CREATE TRIGGER dataset_snapshot_trials_update_immutable
+BEFORE UPDATE ON dataset_snapshot_trials
+WHEN (SELECT status FROM dataset_snapshots WHERE id=OLD.snapshot_id) = 'ready'
+BEGIN SELECT RAISE(ABORT, 'ready dataset snapshots are immutable'); END;
+CREATE TRIGGER dataset_snapshot_trials_delete_immutable
+BEFORE DELETE ON dataset_snapshot_trials
+WHEN (SELECT status FROM dataset_snapshots WHERE id=OLD.snapshot_id) = 'ready'
+BEGIN SELECT RAISE(ABORT, 'ready dataset snapshots are immutable'); END;
 """),)
 
 

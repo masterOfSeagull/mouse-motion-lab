@@ -9,9 +9,9 @@ class TrajectoryLoadError(RuntimeError):
     pass
 
 
-def load_trial_trajectory(raw_sessions_root: Path, trial: dict[str, Any], raw_files: list[dict[str, Any]], maximum_points: int = 700) -> dict[str, Any]:
+def load_trial_trajectory(raw_sessions_root: Path, trial: dict[str, Any], raw_files: list[dict[str, Any]], maximum_points: int | None = 700) -> dict[str, Any]:
     """Return display-ready coordinates limited to the trial's explicit phase bounds."""
-    if maximum_points < 2:
+    if maximum_points is not None and maximum_points < 2:
         raise ValueError("maximum_points must be at least two")
     start_ns = trial.get("target_appeared_ns")
     end_ns = trial.get("valid_click_ns") or trial.get("ended_ns")
@@ -41,7 +41,7 @@ def load_trial_trajectory(raw_sessions_root: Path, trial: dict[str, Any], raw_fi
                 points.append({"timestamp_ns": int(timestamp_ns), "x": int(screen_x), "y": int(screen_y)})
     points.sort(key=lambda point: point["timestamp_ns"])
     raw_point_count = len(points)
-    if len(points) > maximum_points:
+    if maximum_points is not None and len(points) > maximum_points:
         step = (len(points) - 1) / (maximum_points - 1)
         points = [points[round(index * step)] for index in range(maximum_points)]
 

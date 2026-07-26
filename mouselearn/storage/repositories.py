@@ -14,6 +14,7 @@ from mouselearn.domain.collection import (
     TrialFinalization,
     TrialPlan,
 )
+from mouselearn.domain.dataset import DatasetSnapshotPlan, session_held_out_assignments
 
 
 def utcnow() -> str:
@@ -342,4 +343,157 @@ class Repositories:
             result["condition"] = json.loads(result.pop("condition_json"))
             result["clicks"] = json.loads(result.pop("clicks_json"))
             results.append(result)
+        return results
+
+    def eligible_dataset_sessions(self) -> list[dict[str, Any]]:
+        """Completed, retained sessions with finalized raw evidence and valid trials."""
+        rows = self.conn.execute(
+            """SELECT s.id, s.created_at, d.display_name, count(t.id) AS trial_count
+               FROM recording_sessions AS s
+               JOIN collection_session_details AS d ON d.session_id=s.id
+               LEFT JOIN collection_session_reviews AS sr ON sr.session_id=s.id
+               JOIN trials AS t ON t.session_id=s.id
+               JOIN trial_details AS td ON td.trial_id=t.id
+               LEFT JOIN trial_reviews AS tr ON tr.trial_id=t.id
+               WHERE s.status='completed' AND d.state='completed'
+                 AND COALESCE(sr.disposition, 'retained')='retained'
+                 AND t.status='completed' AND td.valid_click_ns IS NOT NULL
+                 AND COALESCE(tr.disposition, 'retained')='retained'
+                 AND EXISTS(SELECT 1 FROM raw_event_files AS rf
+                            WHERE rf.session_id=s.id AND rf.status='complete' AND rf.sha256 IS NOT NULL)
+                 AND NOT EXISTS(SELECT 1 FROM raw_event_files AS rf
+                                WHERE rf.session_id=s.id AND (rf.status <> 'complete' OR rf.sha256 IS NULL))
+               GROUP BY s.id ORDER BY s.created_at, s.id"""
+        ).fetchall()
+        return [dict(row) for row in rows]
+
+    def create_dataset_snapshot_draft(self, plan: DatasetSnapshotPlan, code_revision: str) -> dict[str, Any]:
+        """Persist all immutable source choices while the manifest is being written."""
+        eligible = self.eligible_dataset_sessions()
+        eligible_by_id = {row["id"]: row for row in eligible}
+        selected_ids = [str(value) for value in plan.session_ids] or [row["id"] for row in eligible]
+        unavailable = [session_id for session_id in selected_ids if session_id not in eligible_by_id]
+        if unavailable:
+            raise ValueError("selected sessions are not eligible for a dataset snapshot: " + ", ".join(unavailable))
+        assignments, warnings = session_held_out_assignments(selected_ids, plan.split.seed)
+        placeholders = ",".join("?" for _ in selected_ids)
+        trial_rows = self.conn.execute(
+            f"""SELECT t.id, t.session_id
+                FROM trials AS t
+                JOIN recording_sessions AS s ON s.id=t.session_id
+                JOIN trial_details AS td ON td.trial_id=t.id
+                LEFT JOIN trial_reviews AS tr ON tr.trial_id=t.id
+                WHERE t.session_id IN ({placeholders}) AND s.status='completed'
+                  AND t.status='completed' AND td.valid_click_ns IS NOT NULL
+                  AND COALESCE(tr.disposition, 'retained')='retained'
+                ORDER BY s.created_at, td.target_appeared_ns, t.id""",
+            selected_ids,
+        ).fetchall()
+        if not trial_rows:
+            raise ValueError("selected sessions contain no retained valid-click trials")
+        raw_rows = self.conn.execute(
+            f"""SELECT session_id, relative_path, sha256, byte_count
+                FROM raw_event_files
+                WHERE session_id IN ({placeholders}) AND status='complete' AND sha256 IS NOT NULL
+                ORDER BY session_id, relative_path""",
+            selected_ids,
+        ).fetchall()
+        hashes_by_session: dict[str, list[str]] = {session_id: [] for session_id in selected_ids}
+        raw_files: list[dict[str, Any]] = []
+        for row in raw_rows:
+            item = dict(row)
+            hashes_by_session[item["session_id"]].append(item["sha256"])
+            raw_files.append(item)
+        missing_hashes = [session_id for session_id, hashes in hashes_by_session.items() if not hashes]
+        if missing_hashes:
+            raise ValueError("selected sessions have no finalized raw event hashes: " + ", ".join(missing_hashes))
+        raw_session_hashes = [{"session_id": session_id, "sha256": hashes_by_session[session_id]} for session_id in selected_ids]
+        ordered_trial_ids = [row["id"] for row in trial_rows]
+        split_config = {"strategy": "session_held_out", **plan.split.model_dump(mode="json")}
+        manifest = {
+            "schema_version": 1,
+            "name": plan.name,
+            "description": plan.description,
+            "ordered_trial_ids": ordered_trial_ids,
+            "raw_session_hashes": raw_session_hashes,
+            "raw_files": raw_files,
+            "preprocessing_config": plan.preprocessing_config,
+            "split_config": split_config,
+            "split_assignments": assignments,
+            "feature_schema_version": plan.feature_schema_version,
+            "code_revision": code_revision,
+            "warnings": warnings,
+        }
+        snapshot_id, now = str(uuid.uuid4()), utcnow()
+        with self.conn:
+            self.conn.execute(
+                "INSERT INTO dataset_snapshots(id,status,created_at) VALUES(?,?,?)", (snapshot_id, "draft", now),
+            )
+            self.conn.execute(
+                """INSERT INTO dataset_snapshot_details(
+                    snapshot_id,name,description,ordered_trial_ids_json,raw_session_hashes_json,
+                    preprocessing_config_json,split_config_json,warnings_json,feature_schema_version,
+                    code_revision,trial_count,session_count
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (
+                    snapshot_id, plan.name, plan.description, json.dumps(ordered_trial_ids), json.dumps(raw_session_hashes),
+                    json.dumps(plan.preprocessing_config, sort_keys=True), json.dumps(split_config, sort_keys=True),
+                    json.dumps(warnings), plan.feature_schema_version, code_revision, len(ordered_trial_ids), len(selected_ids),
+                ),
+            )
+            self.conn.executemany(
+                "INSERT INTO dataset_snapshot_trials(snapshot_id,trial_id,session_id,split,ordinal) VALUES(?,?,?,?,?)",
+                [(snapshot_id, row["id"], row["session_id"], assignments[row["session_id"]], index) for index, row in enumerate(trial_rows)],
+            )
+            self.audit("dataset_snapshot", snapshot_id, "draft_created", {"trial_count": len(ordered_trial_ids), "session_count": len(selected_ids)})
+        return {"id": snapshot_id, "manifest": manifest, "raw_files": raw_files}
+
+    def finalize_dataset_snapshot(self, snapshot_id: str, manifest_relative_path: str, manifest_sha256: str) -> None:
+        if not manifest_relative_path or manifest_relative_path.startswith("/") or ".." in manifest_relative_path.replace("\\", "/").split("/"):
+            raise ValueError("manifest path must be relative to the data root")
+        if len(manifest_sha256) != 64:
+            raise ValueError("manifest hash must be a SHA-256 digest")
+        with self.conn:
+            updated = self.conn.execute(
+                """UPDATE dataset_snapshot_details SET manifest_relative_path=?, manifest_sha256=?
+                   WHERE snapshot_id=?""",
+                (manifest_relative_path.replace("\\", "/"), manifest_sha256, snapshot_id),
+            ).rowcount
+            if updated != 1:
+                raise KeyError(snapshot_id)
+            self.conn.execute("UPDATE dataset_snapshots SET status='ready' WHERE id=? AND status='draft'", (snapshot_id,))
+            self.audit("dataset_snapshot", snapshot_id, "ready", {"manifest_sha256": manifest_sha256})
+
+    def dataset_snapshot(self, snapshot_id: str) -> dict[str, Any]:
+        row = self.conn.execute(
+            """SELECT s.id, s.status, s.created_at, d.name, d.description, d.ordered_trial_ids_json,
+                      d.raw_session_hashes_json, d.preprocessing_config_json, d.split_config_json, d.warnings_json,
+                      d.feature_schema_version, d.code_revision, d.manifest_sha256, d.manifest_relative_path,
+                      d.trial_count, d.session_count
+               FROM dataset_snapshots AS s JOIN dataset_snapshot_details AS d ON d.snapshot_id=s.id
+               WHERE s.id=?""",
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise KeyError(snapshot_id)
+        result = dict(row)
+        for name in ("ordered_trial_ids", "raw_session_hashes", "preprocessing_config", "split_config", "warnings"):
+            result[name] = json.loads(result.pop(f"{name}_json"))
+        result["splits"] = [dict(item) for item in self.conn.execute(
+            "SELECT trial_id,session_id,split,ordinal FROM dataset_snapshot_trials WHERE snapshot_id=? ORDER BY ordinal", (snapshot_id,)
+        )]
+        return result
+
+    def dataset_snapshots(self) -> list[dict[str, Any]]:
+        rows = self.conn.execute(
+            """SELECT s.id, s.status, s.created_at, d.name, d.trial_count, d.session_count,
+                      d.manifest_sha256, d.manifest_relative_path, d.warnings_json
+               FROM dataset_snapshots AS s JOIN dataset_snapshot_details AS d ON d.snapshot_id=s.id
+               ORDER BY s.created_at DESC"""
+        ).fetchall()
+        results = []
+        for row in rows:
+            item = dict(row)
+            item["warnings"] = json.loads(item.pop("warnings_json"))
+            results.append(item)
         return results
