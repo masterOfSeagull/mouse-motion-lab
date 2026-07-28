@@ -6,7 +6,7 @@ from pathlib import Path
 from PySide6.QtCore import QObject, Property, Signal, Slot
 
 from mouselearn.models import PromotionError, compare_models, promote_model
-from mouselearn.export import export_conditional_flow
+from mouselearn.export import export_conditional_flow, export_pca_mixture
 from mouselearn.storage.database import connect
 from mouselearn.storage.repositories import Repositories
 
@@ -52,10 +52,11 @@ class RegistryController(QObject):
             try:
                 repos = Repositories(conn)
                 model = repos.baseline_model(model_id)
-                if model["model_type"] != "conditional_flow" or model["status"] != "ready":
-                    raise ValueError("only ready conditional-flow models support portable export")
+                if model["model_type"] not in {"conditional_flow", "pca_mixture"} or model["status"] != "ready":
+                    raise ValueError("only ready conditional-flow and PCA-mixture models support portable export")
                 destination = self.root / "exports" / f"{model_id}-portable"
-                export_conditional_flow((self.root / model["manifest_relative_path"]).parent, destination)
+                exporter = export_pca_mixture if model["model_type"] == "pca_mixture" else export_conditional_flow
+                exporter((self.root / model["manifest_relative_path"]).parent, destination)
                 repos.audit("model", model_id, "exported", {"destination": str(destination)})
             finally:
                 conn.close()

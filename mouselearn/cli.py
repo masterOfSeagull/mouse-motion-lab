@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 
 from mouselearn.diagnostics.checks import database_check, environment_checks, filesystem_check
-from mouselearn.export import OnnxFlowRuntime, export_conditional_flow
+from mouselearn.export import OnnxFlowRuntime, export_conditional_flow, export_pca_mixture
 from mouselearn.models import GenerationRequest
 from mouselearn.storage.bootstrap import initialize
 from mouselearn.storage.database import connect
@@ -41,11 +41,11 @@ def main(argv: list[str] | None = None) -> int:
             repos = Repositories(conn)
             models = repos.registry_models()
             model = next((item for item in models if item["id"] == args.model_id), None) if args.model_id else next((item for item in models if item["lifecycle"] == "active"), None)
-            if model is None or model["model_type"] != "conditional_flow" or model["status"] != "ready":
-                raise ValueError("export requires a ready conditional-flow model")
+            if model is None or model["model_type"] not in {"conditional_flow", "pca_mixture"} or model["status"] != "ready":
+                raise ValueError("export requires a ready conditional-flow or PCA-mixture model")
             source = (root / model["manifest_relative_path"]).parent
             destination = (args.destination or (root / "exports" / f"{model['id']}-portable")).resolve()
-            manifest = export_conditional_flow(source, destination)
+            manifest = export_pca_mixture(source, destination) if model["model_type"] == "pca_mixture" else export_conditional_flow(source, destination)
             repos.audit("model", model["id"], "exported", {"destination": str(destination), "manifest": manifest})
             print(destination)
         finally:

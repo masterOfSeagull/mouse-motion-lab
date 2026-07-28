@@ -24,7 +24,7 @@ struct Runtime {
     std::unique_ptr<Ort::Session> session;
     std::vector<double> condition_mean, condition_scale, training_conditions, output_mean, output_scale;
     std::size_t condition_size{}, output_size{}, training_count{};
-    std::uint32_t solver_steps{16}; bool heun{true}, zero_condition{false}; std::string error;
+    std::uint32_t solver_steps{16}; bool heun{true}, zero_condition{false}; std::string model_id, error;
 };
 template<class T> void read_exact(std::ifstream& in, T* data, std::size_t count) {
     in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(sizeof(T) * count));
@@ -84,7 +84,7 @@ extern "C" MGResult mg_create(const char* directory, MGHandle* output) {
         if(std::memcmp(magic,"MMLNORM1",8)!=0||c!=21||o!=129||n==0) throw std::runtime_error("unsupported normalization artifact");
         r->condition_size=c;r->output_size=o;r->training_count=n; r->condition_mean.resize(c);r->condition_scale.resize(c);r->training_conditions.resize(static_cast<std::size_t>(c)*n);r->output_mean.resize(o);r->output_scale.resize(o);
         read_exact(in,r->condition_mean.data(),c);read_exact(in,r->condition_scale.data(),c);read_exact(in,r->training_conditions.data(),static_cast<std::size_t>(c)*n);read_exact(in,r->output_mean.data(),o);read_exact(in,r->output_scale.data(),o);
-        std::smatch match; if(std::regex_search(manifest,match,std::regex("\"solver_steps\":([0-9]+)"))) r->solver_steps=static_cast<std::uint32_t>(std::stoul(match[1])); r->heun=manifest.find("\"solver\":\"heun\"")!=std::string::npos; r->zero_condition=manifest.find("\"condition_mode\":\"zero\"")!=std::string::npos;
+        std::smatch match; if(std::regex_search(manifest,match,std::regex("\"solver_steps\":([0-9]+)"))) r->solver_steps=static_cast<std::uint32_t>(std::stoul(match[1]));if(std::regex_search(manifest,match,std::regex("\"model_id\":\"([^\"]+)\"")))r->model_id=match[1]; r->heun=manifest.find("\"solver\":\"heun\"")!=std::string::npos; r->zero_condition=manifest.find("\"condition_mode\":\"zero\"")!=std::string::npos;
         r->options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL); r->options.SetIntraOpNumThreads(1); r->session=std::make_unique<Ort::Session>(r->env,(root/"velocity.onnx").c_str(),r->options);
         *output=r.release();global_error.clear();return MG_OK;
     } catch(const std::exception& e){set_error(nullptr,e.what());return MG_RUNTIME_ERROR;}
@@ -108,3 +108,5 @@ extern "C" MGResult mg_generate(MGHandle handle,const MGGenerationRequest* q,MGT
 extern "C" void mg_free_trajectory(MGTrajectory* value){if(value){delete[] value->samples;*value={};}}
 extern "C" void mg_destroy(MGHandle handle){delete static_cast<Runtime*>(handle);}
 extern "C" const char* mg_last_error(MGHandle handle){auto* r=static_cast<Runtime*>(handle);return r?r->error.c_str():global_error.c_str();}
+extern "C" const char* mg_model_id(MGHandle handle){auto* r=static_cast<Runtime*>(handle);return r?r->model_id.c_str():"";}
+extern "C" std::size_t mg_position_count(MGHandle handle){auto* r=static_cast<Runtime*>(handle);return r?(r->output_size-1)/2:0;}

@@ -14,7 +14,7 @@ from mouselearn.models import (
     ConditionalFlowConfig, ConditionalFlowGenerator, GenerationRequest, PcaMixtureConfig, PcaMixtureGenerator, ProcessedDataset,
     RetrievalConfig, RetrievalGenerator, condition_vector, constrain_parameter_output, decode_output, validate_baseline,
 )
-from mouselearn.export import OnnxFlowRuntime, export_conditional_flow
+from mouselearn.export import OnnxFlowRuntime, PortablePcaRuntime, export_conditional_flow, export_pca_mixture
 from mouselearn.cli import main as cli_main
 
 
@@ -103,6 +103,59 @@ def test_pca_mixture_supports_128_point_artifacts(tmp_path: Path) -> None:
     report = validate_baseline(loaded, dataset)
     assert report["passed"]
     assert report["position_count"] == 128
+
+
+def test_portable_pca_export_is_hashed_dynamic_and_exact_endpoint(tmp_path: Path) -> None:
+    dataset = _dataset(position_count=128)
+    source = tmp_path / "source"
+    PcaMixtureGenerator(PcaMixtureConfig(latent_dimension=12, mixture_component_count=4)).fit(dataset).save(source)
+    destination = tmp_path / "portable"
+    manifest = export_pca_mixture(source, destination)
+    assert manifest["position_count"] == 128
+    assert manifest["output_size"] == 257
+    runtime = PortablePcaRuntime(destination)
+    first, distance, ood = runtime.generate_parameters(dataset.conditions[24], 123, exact_endpoint=True)
+    repeated, repeated_distance, repeated_ood = runtime.generate_parameters(dataset.conditions[24], 123, exact_endpoint=True)
+    assert np.array_equal(first, repeated)
+    assert (distance, ood) == (repeated_distance, repeated_ood)
+    assert np.array_equal(first[:2], np.zeros(2))
+    assert np.allclose(first[-3:-1], (1.0, 0.0), atol=1e-14)
+    points = first[:-1].reshape(-1, 2)
+    raw, *_ = PortablePcaRuntime(destination).generate_parameters(dataset.conditions[24], 123)
+    raw_points = raw[:-1].reshape(-1, 2)
+    # A single similarity transform preserves all pairwise distance ratios.
+    assert np.allclose(
+        np.linalg.norm(points[1:] - points[:-1], axis=1) / np.linalg.norm(points[-1] - points[0]),
+        np.linalg.norm(raw_points[1:] - raw_points[:-1], axis=1) / np.linalg.norm(raw_points[-1] - raw_points[0]),
+    )
+    if sys.platform == "win32":
+        cli = Path(__file__).parents[1] / "build" / "native" / "Release" / "mousegen_pca_cli.exe"
+        assert cli.is_file(), "build native targets before running PCA cross-runtime parity"
+        request = dataset.requests[24]
+        native = json.loads(subprocess.run([
+            str(cli), str(destination), str(request.start_x), str(request.start_y),
+            str(request.target_center_x), str(request.target_center_y), str(request.target_radius), "123",
+            str(request.virtual_desktop_left), str(request.virtual_desktop_top),
+            str(request.virtual_desktop_width), str(request.virtual_desktop_height), "exact",
+        ], check=True, capture_output=True, text=True).stdout)
+        distance_px = math.dist((request.start_x, request.start_y), (request.target_center_x, request.target_center_y))
+        angle = math.atan2(request.target_center_y - request.start_y, request.target_center_x - request.start_x)
+        cosine, sine = math.cos(angle), math.sin(angle)
+        expected = []
+        duration = round(math.exp(np.clip(first[-1], math.log(1e6), math.log(6e10))))
+        for index, point in enumerate(points):
+            x = request.start_x + distance_px * (cosine * point[0] - sine * point[1])
+            y = request.start_y + distance_px * (sine * point[0] + cosine * point[1])
+            expected.append((round(duration * index / 127), np.clip(x, 0, 1919), np.clip(y, 0, 1079)))
+        expected[0] = (0, request.start_x, request.start_y)
+        expected[-1] = (duration, request.target_center_x, request.target_center_y)
+        assert len(native["points"]) == 128
+        assert np.allclose(native["points"], expected, atol=1e-9)
+    damaged = bytearray((destination / "pca.bin").read_bytes())
+    damaged[-1] ^= 1
+    (destination / "pca.bin").write_bytes(damaged)
+    with pytest.raises(ValueError, match="hash changed"):
+        PortablePcaRuntime(destination)
 
 
 def test_zero_distance_request_returns_positive_settling_trajectory() -> None:
