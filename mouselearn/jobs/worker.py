@@ -7,7 +7,7 @@ import time
 from pathlib import Path
 
 from mouselearn.diagnostics.checks import database_check, display_check, environment_checks, filesystem_check
-from mouselearn.preprocessing import preprocess_dataset_snapshot
+from mouselearn.preprocessing import PreprocessingSpec, preprocess_dataset_snapshot
 from mouselearn.models.training import build_baseline_model
 from mouselearn.models import ConditionalFlowConfig, train_conditional_flow
 from mouselearn.domain.events import WorkerEvent
@@ -79,7 +79,9 @@ def run_preprocessing(job_id: str, snapshot_id: str, root: Path | None = None) -
         _persist_then_emit(repos, WorkerEvent(event="stage_changed", job_id=job_id, stage="verifying"))
         _persist_then_emit(repos, WorkerEvent(event="progress", job_id=job_id, stage="verifying", progress=10))
         _persist_then_emit(repos, WorkerEvent(event="stage_changed", job_id=job_id, stage="representing"))
-        result = preprocess_dataset_snapshot(root, database_path(root), snapshot_id)
+        snapshot = repos.dataset_snapshot(snapshot_id)
+        spec = PreprocessingSpec(**snapshot["preprocessing_config"])
+        result = preprocess_dataset_snapshot(root, database_path(root), snapshot_id, spec)
         _persist_then_emit(repos, WorkerEvent(event="metric", job_id=job_id, stage="representing", name="processed_trials", value=result["processed_trial_count"]))
         _persist_then_emit(repos, WorkerEvent(event="metric", job_id=job_id, stage="representing", name="resampling_max_error", value=result["resampling"]["max_error"]))
         _persist_then_emit(repos, WorkerEvent(event="progress", job_id=job_id, stage="representing", progress=95))

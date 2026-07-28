@@ -114,12 +114,20 @@ class ProcessedDataset:
         count = len(conditions)
         if conditions.ndim != 2 or conditions.shape[1] != len(CONDITION_FEATURE_NAMES):
             raise ValueError("processed conditions have the wrong shape")
-        if outputs.shape != (count, OUTPUT_SIZE) or not all(len(items) == count for items in (self.requests, self.splits, self.trial_ids)):
+        if (
+            outputs.ndim != 2 or outputs.shape[0] != count or outputs.shape[1] < 5 or outputs.shape[1] % 2 != 1
+            or not all(len(items) == count for items in (self.requests, self.splits, self.trial_ids))
+        ):
             raise ValueError("processed dataset arrays and metadata do not align")
         if count == 0 or not np.isfinite(conditions).all() or not np.isfinite(outputs).all():
             raise ValueError("processed dataset must contain finite samples")
         object.__setattr__(self, "conditions", conditions)
         object.__setattr__(self, "outputs", outputs)
+
+    @property
+    def position_count(self) -> int:
+        """Fixed equal-time position count carried by this processed artifact."""
+        return (self.outputs.shape[1] - 1) // 2
 
     def subset(self, split: str) -> "ProcessedDataset":
         indices = [index for index, value in enumerate(self.splits) if value == split]
@@ -167,7 +175,7 @@ def condition_vector(request: GenerationRequest) -> np.ndarray:
 def constrain_parameter_output(output: np.ndarray, radius_distance_ratio: float, safety_margin: float = 0.99) -> np.ndarray:
     """Keep the exact start and endpoint valid before the runtime safety decoder."""
     values = np.asarray(output, dtype=np.float64).copy()
-    if values.shape != (OUTPUT_SIZE,) or not np.isfinite(values).all() or radius_distance_ratio <= 0:
+    if values.ndim != 1 or values.size < 5 or values.size % 2 != 1 or not np.isfinite(values).all() or radius_distance_ratio <= 0:
         raise ValueError("parameter output and target-radius ratio must be valid")
     values[:2] = 0.0
     endpoint = values[-3:-1]
@@ -205,11 +213,12 @@ def decode_output(
     output: np.ndarray, request: GenerationRequest, *, condition_distance: float = 0.0,
     out_of_distribution: bool = False, endpoint_safety_margin: float = 0.995,
 ) -> GenerationResult:
-    """Decode one 129-value model vector into a valid, equal-time screen trajectory."""
+    """Decode one fixed-size model vector into a valid, equal-time screen trajectory."""
     values = np.asarray(output, dtype=np.float64)
-    if values.shape != (OUTPUT_SIZE,) or not np.isfinite(values).all():
-        raise ValueError("generated output must contain 129 finite values")
-    canonical = values[:-1].reshape(POSITION_COUNT, 2).copy()
+    if values.ndim != 1 or values.size < 5 or values.size % 2 != 1 or not np.isfinite(values).all():
+        raise ValueError("generated output must contain x/y position pairs plus one finite duration value")
+    position_count = (values.size - 1) // 2
+    canonical = values[:-1].reshape(position_count, 2).copy()
     canonical[0] = 0.0
     duration = int(round(math.exp(float(np.clip(values[-1], math.log(1_000_000), math.log(60_000_000_000))))))
     dx = request.target_center_x - request.start_x
@@ -217,7 +226,7 @@ def decode_output(
     distance = math.hypot(dx, dy)
     endpoint_projected = False
     if distance <= 1e-9:
-        screen = np.repeat(np.asarray([[request.start_x, request.start_y]]), POSITION_COUNT, axis=0)
+        screen = np.repeat(np.asarray([[request.start_x, request.start_y]]), position_count, axis=0)
     else:
         radius_ratio = request.target_radius / distance
         endpoint_offset = canonical[-1] - np.asarray([1.0, 0.0])
@@ -242,7 +251,7 @@ def decode_output(
     clipped[:, 0] = np.clip(clipped[:, 0], left, right)
     clipped[:, 1] = np.clip(clipped[:, 1], top, bottom)
     clipped_count = int(np.count_nonzero(np.any(clipped != screen, axis=1)))
-    timestamps = [round(duration * index / (POSITION_COUNT - 1)) for index in range(POSITION_COUNT)]
+    timestamps = [round(duration * index / (position_count - 1)) for index in range(position_count)]
     timestamps[0], timestamps[-1] = 0, duration
     samples = tuple(TrajectorySample(timestamp, float(point[0]), float(point[1])) for timestamp, point in zip(timestamps, clipped, strict=True))
     return GenerationResult(

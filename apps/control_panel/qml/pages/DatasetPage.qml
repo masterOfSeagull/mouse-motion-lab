@@ -33,7 +33,7 @@ Item {
             text: {
                 var run = datasetPage.datasetController.preprocessingRuns[0]
                 var resampling = run.resampling_max_error === undefined || run.resampling_max_error === null ? "" : " • resampling error " + Number(run.resampling_max_error).toFixed(4)
-                return "Latest representation: " + run.status + " • " + run.processed_trial_count + " processed • " + run.skipped_trial_count + " skipped" + resampling
+                return "Latest processed dataset: " + run.display_name + " | " + run.processed_trial_count + " processed | " + run.skipped_trial_count + " skipped" + resampling
             }
             color: datasetPage.datasetController.preprocessingRuns.length && datasetPage.datasetController.preprocessingRuns[0].status === "completed" ? "#047857" : "#b45309"
             wrapMode: Text.Wrap

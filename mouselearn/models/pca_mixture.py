@@ -118,14 +118,15 @@ class PcaMixtureGenerator:
         destination.mkdir(parents=True, exist_ok=False)
         np.savez_compressed(destination / "weights.npz", **arrays)
         (destination / "model.json").write_text(json.dumps({
-            "schema_version": 1, "model_type": self.model_type,
+            "schema_version": 2, "model_type": self.model_type,
             "config": self.config.__dict__, "latent_dimension": int(self._components.shape[0]),
+            "position_count": int((self._output_mean.shape[0] - 1) // 2),
         }, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
 
     @classmethod
     def load(cls, source: Path) -> "PcaMixtureGenerator":
         manifest = json.loads((source / "model.json").read_text(encoding="utf-8"))
-        if manifest.get("schema_version") != 1 or manifest.get("model_type") != cls.model_type:
+        if manifest.get("schema_version") not in {1, 2} or manifest.get("model_type") != cls.model_type:
             raise ValueError("unsupported PCA mixture manifest")
         model = cls(PcaMixtureConfig(**manifest["config"]))
         with np.load(source / "weights.npz") as weights:

@@ -48,6 +48,8 @@ class DatasetController(QObject):
             self._snapshots = repositories.dataset_snapshots()
             self._preprocessing_runs = repositories.preprocessing_runs()
             for run in self._preprocessing_runs:
+                status = "" if run["status"] == "completed" else f" | {run['status']}"
+                run["display_name"] = f"{run['snapshot_name']} | run {run['id'][:8]}{status}"
                 report_path = run.get("report_relative_path")
                 if not report_path:
                     continue
@@ -56,6 +58,12 @@ class DatasetController(QObject):
                     try:
                         report = json.loads(candidate.read_text(encoding="utf-8"))
                         run["resampling_max_error"] = report.get("resampling", {}).get("max_error")
+                        position_count = report.get("config", {}).get("equal_time_position_count")
+                        if position_count:
+                            run["position_count"] = int(position_count)
+                            run["display_name"] = (
+                                f"{run['snapshot_name']} | {position_count} points | run {run['id'][:8]}{status}"
+                            )
                     except (OSError, json.JSONDecodeError):
                         run["resampling_max_error"] = None
         finally:

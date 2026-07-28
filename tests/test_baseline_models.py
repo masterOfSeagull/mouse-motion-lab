@@ -8,16 +8,17 @@ from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
+import pytest
 
 from mouselearn.models import (
     ConditionalFlowConfig, ConditionalFlowGenerator, GenerationRequest, PcaMixtureConfig, PcaMixtureGenerator, ProcessedDataset,
-    RetrievalConfig, RetrievalGenerator, condition_vector, decode_output, validate_baseline,
+    RetrievalConfig, RetrievalGenerator, condition_vector, constrain_parameter_output, decode_output, validate_baseline,
 )
 from mouselearn.export import OnnxFlowRuntime, export_conditional_flow
 from mouselearn.cli import main as cli_main
 
 
-def _dataset() -> ProcessedDataset:
+def _dataset(position_count: int = 64) -> ProcessedDataset:
     requests, conditions, outputs, splits, trial_ids = [], [], [], [], []
     for index in range(36):
         angle = 2 * math.pi * index / 36
@@ -29,8 +30,8 @@ def _dataset() -> ProcessedDataset:
         )
         canonical = []
         bend = ((index % 3) - 1) * 0.035
-        for position in range(64):
-            progress = position / 63
+        for position in range(position_count):
+            progress = position / (position_count - 1)
             canonical.extend((progress, bend * math.sin(math.pi * progress)))
         canonical[-2] = 1.0 + 0.02 * math.cos(angle)
         canonical[-1] = 0.02 * math.sin(angle)
@@ -85,6 +86,23 @@ def test_pca_mixture_is_seeded_valid_and_round_trips_artifact(tmp_path: Path) ->
     restored = loaded.generate_batch(dataset.conditions[24:26], seeds)
     assert np.array_equal(first.outputs, restored.outputs)
     assert validate_baseline(loaded, dataset)["passed"]
+
+
+def test_pca_mixture_supports_128_point_artifacts(tmp_path: Path) -> None:
+    dataset = _dataset(position_count=128)
+    model = PcaMixtureGenerator(PcaMixtureConfig(latent_dimension=12, mixture_component_count=4)).fit(dataset)
+    destination = tmp_path / "pca-128"
+    model.save(destination)
+    manifest = json.loads((destination / "model.json").read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 2
+    assert manifest["position_count"] == 128
+    loaded = PcaMixtureGenerator.load(destination)
+    generated = loaded.generate_batch(dataset.conditions[24:25], np.asarray([123], dtype=np.uint64))
+    result = decode_output(generated.outputs[0], dataset.requests[24])
+    assert len(result.samples) == 128
+    report = validate_baseline(loaded, dataset)
+    assert report["passed"]
+    assert report["position_count"] == 128
 
 
 def test_zero_distance_request_returns_positive_settling_trajectory() -> None:
@@ -160,3 +178,81 @@ def test_small_conditional_flow_trains_checkpoints_and_round_trips(tmp_path: Pat
         ], capture_output=True, text=True)
         assert rejected.returncode != 0
         assert "hash changed" in rejected.stderr
+
+
+def test_zero_condition_flow_uses_every_row_and_ignores_request_conditions(tmp_path: Path) -> None:
+    dataset = _dataset()
+    config = ConditionalFlowConfig(
+        hidden_size=16, hidden_layers=1, epochs=2, batch_size=36, learning_rate=0.001,
+        checkpoint_every=1, solver_steps=2, training_scope="all", validation_mode="none",
+        condition_mode="zero",
+    )
+    model = ConditionalFlowGenerator(config).fit(dataset)
+    assert model._training_conditions.shape == (36, 21)
+    assert np.count_nonzero(model._training_conditions) == 0
+    assert all("validation_loss" not in item for item in model.history)
+
+    conditions = dataset.conditions[[0, 20]].copy()
+    conditions[1, 3] = conditions[0, 3]
+    generated = model.generate_batch(conditions, np.asarray([7, 7], dtype=np.uint64))
+    assert np.array_equal(generated.outputs[0], generated.outputs[1])
+    assert np.array_equal(generated.nearest_distances, np.zeros(2))
+
+    destination = tmp_path / "zero-condition-flow"
+    model.save(destination)
+    loaded = ConditionalFlowGenerator.load(destination)
+    assert loaded.config.condition_mode == "zero"
+    assert np.array_equal(generated.outputs, loaded.generate_batch(conditions, np.asarray([7, 7], dtype=np.uint64)).outputs)
+    manifest = export_conditional_flow(destination, tmp_path / "zero-condition-onnx")
+    assert manifest["condition_mode"] == "zero"
+
+
+def test_training_sample_flow_starts_from_seeded_recorded_path_and_exposes_trace(tmp_path: Path) -> None:
+    dataset = _dataset()
+    config = ConditionalFlowConfig(
+        hidden_size=16, hidden_layers=1, epochs=2, batch_size=36, learning_rate=0.001,
+        checkpoint_every=1, solver_steps=2, training_scope="all", validation_mode="none",
+        condition_mode="zero", source_mode="training_sample",
+    )
+    model = ConditionalFlowGenerator(config).fit(dataset)
+    condition = dataset.conditions[:1]
+    seed = 7
+    generated = model.generate_batch(condition, np.asarray([seed], dtype=np.uint64))
+    expected_source_index = int(np.random.default_rng(seed).integers(len(dataset.outputs)))
+    assert generated.source_indices.tolist() == [expected_source_index]
+
+    source = model._source_outputs[expected_source_index]
+    trace = model.integrate_source_trace(np.zeros(21), source)
+    assert trace.shape == (config.solver_steps + 1, 129)
+    assert np.allclose(trace[0], dataset.outputs[expected_source_index])
+    assert np.allclose(generated.outputs[0], constrain_parameter_output(trace[-1], condition[0, 3]))
+
+    destination = tmp_path / "training-sample-flow"
+    model.save(destination)
+    loaded = ConditionalFlowGenerator.load(destination)
+    assert np.array_equal(
+        generated.outputs, loaded.generate_batch(condition, np.asarray([seed], dtype=np.uint64)).outputs,
+    )
+    with pytest.raises(ValueError, match="does not yet support training-sample"):
+        export_conditional_flow(destination, tmp_path / "unsupported-export")
+
+
+def test_training_sample_source_can_amplify_canonical_vertical_axis() -> None:
+    dataset = _dataset()
+    config = ConditionalFlowConfig(
+        hidden_size=16, hidden_layers=1, epochs=1, batch_size=36, checkpoint_every=1,
+        solver_steps=2, training_scope="all", validation_mode="none", condition_mode="zero",
+        source_mode="training_sample", source_vertical_scale=3.0,
+    )
+    model = ConditionalFlowGenerator(config).fit(dataset)
+    source_index = int(np.random.default_rng(7).integers(len(dataset.outputs)))
+    source = model.integrate_source_trace(np.zeros(21), model._source_outputs[source_index])[0]
+    expected = dataset.outputs[source_index].copy()
+    expected_positions = expected[:-1].reshape(64, 2)
+    expected_positions[:, 1] *= 3
+    assert np.allclose(source, expected)
+    assert source[-1] == pytest.approx(dataset.outputs[source_index, -1])
+    unamplified = ConditionalFlowGenerator(replace(config, source_vertical_scale=1.0)).fit(dataset)
+    assert model.history[0]["training_loss"] != pytest.approx(unamplified.history[0]["training_loss"])
+    with pytest.raises(ValueError, match="requires training-sample"):
+        ConditionalFlowConfig(source_vertical_scale=3.0)

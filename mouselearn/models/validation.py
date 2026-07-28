@@ -61,7 +61,8 @@ def validate_baseline(generator: MovementGenerator, dataset: ProcessedDataset) -
             )
             endpoint_distance = math.hypot(result.endpoint_x - request.target_center_x, result.endpoint_y - request.target_center_y)
             valid = (
-                len(result.samples) == 64 and result.samples[0].x == request.start_x and result.samples[0].y == request.start_y
+                len(result.samples) == dataset.position_count
+                and result.samples[0].x == request.start_x and result.samples[0].y == request.start_y
                 and endpoint_distance <= request.target_radius + 1e-6 and result.movement_duration_ns > 0
                 and all(right.relative_time_ns > left.relative_time_ns for left, right in zip(result.samples, result.samples[1:], strict=False))
                 and all(math.isfinite(value) for sample in result.samples for value in (sample.x, sample.y))
@@ -83,6 +84,7 @@ def validate_baseline(generator: MovementGenerator, dataset: ProcessedDataset) -
     report = {
         "schema_version": 1, "snapshot_id": dataset.snapshot_id, "preprocessing_run_id": dataset.preprocessing_run_id,
         "model_type": generator.model_type, "held_out_sample_count": total,
+        "position_count": dataset.position_count,
         "hard_correctness": {"passed": not correctness_failures, "failure_count": len(correctness_failures), "failures": correctness_failures[:25]},
         "deterministic_same_seed": deterministic,
         "endpoint_projection_count": projected, "endpoint_projection_rate": projected / total,

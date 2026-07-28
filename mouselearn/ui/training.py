@@ -18,7 +18,7 @@ class TrainingController(QObject):
         super().__init__(parent)
         self.database, self._start_training = database, start_training
         self._experiments: list[dict] = []
-        self._message = "Choose a completed representation and a conditional-flow preset."
+        self._message = "Choose a processed dataset and a conditional-flow preset."
         self.refresh()
 
     @Property("QVariantList", notify=experimentsChanged)
@@ -42,7 +42,7 @@ class TrainingController(QObject):
     @Slot(str, str)
     def startTraining(self, preprocessing_run_id: str, preset: str) -> None:
         if not preprocessing_run_id or preset not in {"small", "standard"}:
-            self._message = "Select a completed representation and valid preset."
+            self._message = "Select a completed processed dataset and valid preset."
         else:
             self._start_training(preprocessing_run_id, preset)
             self._message = f"Conditional-flow {preset} training is starting in the worker."

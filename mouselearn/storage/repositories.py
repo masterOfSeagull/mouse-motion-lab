@@ -687,9 +687,12 @@ class Repositories:
 
     def preprocessing_runs(self) -> list[dict[str, Any]]:
         rows = self.conn.execute(
-            """SELECT r.id,r.status,r.created_at,d.snapshot_id,d.processed_relative_path,d.report_relative_path,
-                      d.processed_trial_count,d.skipped_trial_count,d.error,d.finished_at
+            """SELECT r.id,r.status,r.created_at,d.snapshot_id,s.name AS snapshot_name,
+                      s.trial_count AS snapshot_trial_count,s.session_count AS snapshot_session_count,
+                      d.processed_relative_path,d.report_relative_path,d.processed_trial_count,
+                      d.skipped_trial_count,d.error,d.finished_at
                  FROM preprocessing_runs r JOIN preprocessing_run_details d ON d.run_id=r.id
+                 JOIN dataset_snapshot_details s ON s.snapshot_id=d.snapshot_id
                  ORDER BY r.created_at DESC"""
         ).fetchall()
         return [dict(row) for row in rows]
@@ -847,6 +850,36 @@ class Repositories:
             self.conn.execute("ROLLBACK")
             raise
 
+    def finalize_candidate_model(self, model_id: str, manifest_relative_path: str, manifest_sha256: str) -> None:
+        """Publish an explicitly unvalidated artifact as a non-promotable candidate."""
+        if not manifest_relative_path or manifest_relative_path.startswith("/") or ".." in manifest_relative_path.replace("\\", "/").split("/"):
+            raise ValueError("model artifact path must be safe and relative")
+        if len(manifest_sha256) != 64:
+            raise ValueError("model artifact digest must be a SHA-256 value")
+        self.conn.execute("BEGIN IMMEDIATE")
+        try:
+            updated = self.conn.execute(
+                """UPDATE model_details SET manifest_relative_path=?,manifest_sha256=?,
+                          validation_relative_path=NULL,validation_sha256=NULL,error=NULL WHERE model_id=?""",
+                (manifest_relative_path.replace("\\", "/"), manifest_sha256, model_id),
+            ).rowcount
+            status_updated = self.conn.execute(
+                "UPDATE models SET status='ready' WHERE id=? AND status='draft'", (model_id,),
+            ).rowcount
+            if updated != 1 or status_updated != 1:
+                raise RuntimeError("candidate model was not a valid draft")
+            self.audit("model", model_id, "candidate_ready", {"validation": "skipped"})
+            self.conn.execute(
+                """INSERT INTO model_registry(model_id,lifecycle,validation_sha256,updated_at) VALUES(?,?,NULL,?)
+                   ON CONFLICT(model_id) DO UPDATE SET lifecycle=excluded.lifecycle,
+                     validation_sha256=NULL,updated_at=excluded.updated_at""",
+                (model_id, "candidate", utcnow()),
+            )
+            self.conn.execute("COMMIT")
+        except Exception:
+            self.conn.execute("ROLLBACK")
+            raise
+
     def discard_baseline_model_draft(self, model_id: str, error: str) -> None:
         with self.conn:
             row = self.conn.execute("SELECT status FROM models WHERE id=?", (model_id,)).fetchone()
@@ -861,8 +894,10 @@ class Repositories:
         rows = self.conn.execute(
             """SELECT m.id,m.name,m.status,m.created_at,d.model_type,d.dataset_snapshot_id,d.preprocessing_run_id,
                       d.config_json,d.code_revision,d.manifest_relative_path,d.manifest_sha256,
-                      d.validation_relative_path,d.validation_sha256,d.error
+                      d.validation_relative_path,d.validation_sha256,d.error,s.name AS snapshot_name,
+                      s.trial_count AS snapshot_trial_count
                  FROM models m JOIN model_details d ON d.model_id=m.id
+                 JOIN dataset_snapshot_details s ON s.snapshot_id=d.dataset_snapshot_id
                  ORDER BY m.created_at DESC"""
         ).fetchall()
         result = []

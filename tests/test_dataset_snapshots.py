@@ -9,7 +9,7 @@ import pytest
 from mouselearn.datasets.snapshots import DatasetBuildError, build_dataset_snapshot
 from mouselearn.domain.collection import ClickRecord, CollectionSessionPlan, RawEventFileReference, TargetCondition, TrialFinalization, TrialPlan
 from mouselearn.domain.dataset import DatasetSnapshotPlan, SessionHeldOutSplit, session_held_out_assignments
-from mouselearn.preprocessing import preprocess_dataset_snapshot
+from mouselearn.preprocessing import PreprocessingSpec, preprocess_dataset_snapshot
 from mouselearn.storage.bootstrap import initialize
 from mouselearn.storage.database import connect
 from mouselearn.storage.repositories import Repositories
@@ -159,3 +159,44 @@ def test_preprocessing_writes_deterministic_representation_and_report(data_root)
     assert len(records[0]["canonical_positions"]) == 64
     assert records[0]["canonical_positions"][0] == [0.0, 0.0]
     assert records == pq.read_table(root / second["processed_path"]).to_pylist()
+
+
+def test_preprocessing_can_build_128_equal_time_positions(data_root) -> None:
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    root, db, _ = initialize(data_root)
+    conn = connect(db)
+    try:
+        repos = Repositories(conn)
+        sessions = [_completed_session(root, repos, index) for index in range(3)]
+        for index, session_id in enumerate(sessions):
+            raw_path = root / "raw_sessions" / session_id / "events.parquet"
+            start_timestamp = 1_000 + index * 100
+            table = pa.table({
+                "timestamp_ns": [start_timestamp, start_timestamp + 50, start_timestamp + 100],
+                "raw_dx": [0, 100, 100], "raw_dy": [0, 0, 0],
+                "screen_x": [300, 400, 500], "screen_y": [300, 300, 300],
+                "button_flags": [0, 0, 1], "event_flags": [0, 0, 0],
+                "device_handle": [1, 1, 1], "foreground_collection_window": [True, True, True],
+            })
+            pq.write_table(table, raw_path, compression="zstd")
+            payload = raw_path.read_bytes()
+            conn.execute(
+                "UPDATE raw_event_files SET event_count=?, byte_count=?, sha256=? WHERE session_id=?",
+                (3, len(payload), hashlib.sha256(payload).hexdigest(), session_id),
+            )
+    finally:
+        conn.close()
+    snapshot = build_dataset_snapshot(
+        root, db, DatasetSnapshotPlan(
+            name="preprocess-128", session_ids=tuple(sessions),
+            preprocessing_config={"equal_time_position_count": 128},
+        ),
+    )
+    result = preprocess_dataset_snapshot(root, db, snapshot["id"], PreprocessingSpec(equal_time_position_count=128))
+    records = pq.read_table(root / result["processed_path"]).to_pylist()
+    assert len(records) == 3
+    assert all(len(record["canonical_positions"]) == 128 for record in records)
+    report = json.loads((root / result["report_path"]).read_text(encoding="utf-8"))
+    assert report["config"]["equal_time_position_count"] == 128

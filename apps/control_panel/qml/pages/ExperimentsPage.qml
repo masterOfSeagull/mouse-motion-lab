@@ -4,12 +4,14 @@ import QtQuick.Layouts
 
 Item {
     id: page
+    objectName: "experimentsPage"
     property var trainingController
     property var datasetController
     ColumnLayout {
         anchors.fill: parent; anchors.margins: 28; spacing: 12
         RowLayout {
             Layout.fillWidth: true
+            Layout.minimumWidth: 0
             Label { text: "Conditional-flow experiments"; font.pixelSize: 28; font.bold: true }
             Item { Layout.fillWidth: true }
             Button { text: "Refresh"; onClicked: { page.datasetController.refresh(); page.trainingController.refresh() } }
@@ -20,18 +22,34 @@ Item {
         }
         RowLayout {
             Layout.fillWidth: true
-            Label { text: "Representation" }
+            Layout.minimumWidth: 0
+            Label { text: "Flow training data" }
             ComboBox {
-                id: runChoice; Layout.preferredWidth: 230
-                model: page.datasetController.preprocessingRuns; textRole: "id"
-                displayText: currentIndex < 0 ? "No completed runs" : model[currentIndex].id.slice(0, 8) + " · " + model[currentIndex].status
+                id: runChoice
+                objectName: "flowTrainingDataChoice"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 180
+                Layout.maximumWidth: 390
+                model: page.datasetController.preprocessingRuns; textRole: "display_name"
+                displayText: currentIndex < 0 ? "No processed datasets" : model[currentIndex].display_name
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: displayText
+                ToolTip.delay: 400
+                ToolTip.timeout: 10000
             }
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            Item { Layout.fillWidth: true }
             Button {
                 text: "Train small"
                 enabled: runChoice.currentIndex >= 0 && runChoice.model[runChoice.currentIndex].status === "completed"
                 onClicked: page.trainingController.startTraining(runChoice.model[runChoice.currentIndex].id, "small")
             }
             Button {
+                objectName: "trainStandardButton"
                 text: "Train standard"
                 enabled: runChoice.currentIndex >= 0 && runChoice.model[runChoice.currentIndex].status === "completed"
                 onClicked: page.trainingController.startTraining(runChoice.model[runChoice.currentIndex].id, "standard")

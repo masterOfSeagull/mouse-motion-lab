@@ -36,6 +36,8 @@ def export_conditional_flow(model_directory: Path, destination: Path) -> dict[st
     import onnx
     import torch
     model = ConditionalFlowGenerator.load(model_directory)
+    if model.config.source_mode != "gaussian":
+        raise ValueError("portable export does not yet support training-sample flow sources")
     if destination.exists():
         raise FileExistsError(destination)
     destination.mkdir(parents=True)
@@ -66,6 +68,7 @@ def export_conditional_flow(model_directory: Path, destination: Path) -> dict[st
             "dataset_snapshot_id": source_manifest.get("dataset_snapshot_id", "synthetic"),
             "preprocessing_run_id": source_manifest.get("preprocessing_run_id", "synthetic"),
             "solver": model.config.solver, "solver_steps": model.config.solver_steps,
+            "condition_mode": model.config.condition_mode,
             "condition_size": condition_size, "output_size": output_size, "position_count": 64,
             "files": {"velocity.onnx": _digest(onnx_path), "normalization.npz": _digest(destination / "normalization.npz"),
                       "normalization.bin": _digest(normalization_path)},
@@ -122,7 +125,10 @@ class OnnxFlowRuntime:
 
     def generate(self, request: GenerationRequest):
         raw_condition = condition_vector(request)
-        normalized = (raw_condition - self.condition_mean) / self.condition_scale
+        normalized = (
+            np.zeros_like(raw_condition) if self.manifest.get("condition_mode", "full") == "zero"
+            else (raw_condition - self.condition_mean) / self.condition_scale
+        )
         output = self.integrate_source(normalized, self.normal_source(request.random_seed, len(self.output_mean)))
         output = constrain_parameter_output(output, float(raw_condition[3]))
         distances = np.linalg.norm(self.training_conditions - normalized, axis=1)

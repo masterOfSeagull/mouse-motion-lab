@@ -9,7 +9,10 @@ import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
 
-from mouselearn.models import PromotionError, build_baseline_model, load_generator, promote_model
+from mouselearn.models import (
+    ConditionalFlowConfig, PromotionError, build_baseline_model, load_generator, promote_model,
+    train_experimental_conditional_flow,
+)
 from mouselearn.storage.bootstrap import initialize
 from mouselearn.storage.database import connect
 from mouselearn.storage.repositories import Repositories
@@ -111,6 +114,30 @@ def test_baseline_build_publishes_loadable_snapshot_bound_artifact(data_root: Pa
     validation = root / model["validation_relative_path"]
     validation.write_text("{}\n", encoding="utf-8")
     with pytest.raises(PromotionError, match="hash changed"):
+        promote_model(root, database, model["id"])
+
+
+def test_experimental_flow_is_ready_but_remains_unvalidated_candidate(data_root: Path) -> None:
+    root, database, _ = initialize(data_root)
+    run_id = _completed_processed_run(root, database)
+    config = ConditionalFlowConfig(
+        hidden_size=16, hidden_layers=1, epochs=2, batch_size=18, checkpoint_every=1,
+        solver_steps=2, training_scope="all", validation_mode="none", condition_mode="zero",
+    )
+    result = train_experimental_conditional_flow(root, database, run_id, config)
+    conn = connect(database)
+    try:
+        model = Repositories(conn).baseline_model(result["model_id"])
+        registry_model = next(item for item in Repositories(conn).registry_models() if item["id"] == model["id"])
+    finally:
+        conn.close()
+    assert model["status"] == "ready"
+    assert model["validation_relative_path"] is None
+    assert registry_model["lifecycle"] == "candidate"
+    assert result["training_report"]["training_sample_count"] == 18
+    manifest = json.loads((root / model["manifest_relative_path"]).read_text(encoding="utf-8"))
+    assert manifest["validation_status"] == "skipped_by_request"
+    with pytest.raises(PromotionError, match="no completed validation"):
         promote_model(root, database, model["id"])
 
 

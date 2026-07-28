@@ -4,10 +4,19 @@ import QtQuick.Layouts
 
 Item {
     id: page
+    objectName: "generatorPage"
     focus: true
     Keys.onEscapePressed: appController.playbackController.abortFromUi()
     property var generatorController
     property var datasetController
+
+    function latestModelIndex(modelType) {
+        for (var index = 0; index < page.generatorController.models.length; ++index) {
+            if (page.generatorController.models[index].model_type === modelType)
+                return index
+        }
+        return -1
+    }
 
     ColumnLayout {
         anchors.fill: parent
@@ -16,30 +25,46 @@ Item {
 
         RowLayout {
             Layout.fillWidth: true
-            Label { text: "Baseline generator"; font.pixelSize: 28; font.bold: true }
+            Layout.minimumWidth: 0
+            Label { text: "Trajectory generator"; font.pixelSize: 28; font.bold: true }
             Item { Layout.fillWidth: true }
             Button { text: "Refresh"; onClicked: { page.datasetController.refresh(); page.generatorController.refresh() } }
         }
         Label {
-            text: "Models are fit only on the training split and published after deterministic held-out correctness validation. Preview returns data only; it never injects input."
+            text: "The processed-dataset selector below is only for building retrieval and PCA models. Choose any existing generator, including conditional flow, from the separate model selector. Preview never injects input."
             wrapMode: Text.Wrap; Layout.fillWidth: true; color: "#4b5563"
         }
         RowLayout {
             Layout.fillWidth: true
-            Label { text: "Representation" }
+            Layout.minimumWidth: 0
+            Label { text: "Retrieval/PCA training data" }
             ComboBox {
                 id: runChoice
-                Layout.preferredWidth: 210
+                objectName: "generatorTrainingDataChoice"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 180
+                Layout.maximumWidth: 390
                 model: page.datasetController.preprocessingRuns
-                textRole: "id"
-                displayText: currentIndex < 0 ? "No completed runs" : model[currentIndex].id.slice(0, 8) + " - " + model[currentIndex].status
+                textRole: "display_name"
+                displayText: currentIndex < 0 ? "No processed datasets" : model[currentIndex].display_name
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: displayText
+                ToolTip.delay: 400
+                ToolTip.timeout: 10000
             }
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            Item { Layout.fillWidth: true }
             Button {
                 text: "Build retrieval"
                 enabled: runChoice.currentIndex >= 0 && runChoice.model[runChoice.currentIndex].status === "completed"
                 onClicked: page.generatorController.buildBaseline(runChoice.model[runChoice.currentIndex].id, "retrieval")
             }
             Button {
+                objectName: "buildPcaButton"
                 text: "Build PCA mixture"
                 enabled: runChoice.currentIndex >= 0 && runChoice.model[runChoice.currentIndex].status === "completed"
                 onClicked: page.generatorController.buildBaseline(runChoice.model[runChoice.currentIndex].id, "pca_mixture")
@@ -47,19 +72,45 @@ Item {
         }
         RowLayout {
             Layout.fillWidth: true
-            Label { text: "Model" }
+            Layout.minimumWidth: 0
+            Label { text: "Generator model" }
             ComboBox {
                 id: modelChoice
-                Layout.preferredWidth: 250
+                objectName: "generatorModelChoice"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 220
+                Layout.maximumWidth: 440
                 model: page.generatorController.models
-                textRole: "name"
-                displayText: currentIndex < 0 ? "No ready baseline" : model[currentIndex].name
+                textRole: "display_name"
+                displayText: currentIndex < 0 ? "No ready generators" : currentText
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: displayText
+                ToolTip.delay: 400
+                ToolTip.timeout: 10000
             }
-            Label { text: "Seed" }
-            SpinBox { id: seed; from: 0; to: 999999999; value: 42; editable: true }
+            Button {
+                objectName: "useTrainedModelButton"
+                text: "Use trained model"
+                enabled: page.latestModelIndex("conditional_flow") >= 0
+                onClicked: modelChoice.currentIndex = page.latestModelIndex("conditional_flow")
+                hoverEnabled: true
+                ToolTip.visible: hovered
+                ToolTip.text: "Switch to the newest trained conditional-flow model"
+                ToolTip.delay: 400
+                ToolTip.timeout: 10000
+            }
+        }
+        RowLayout {
+            Layout.fillWidth: true
+            Layout.minimumWidth: 0
+            Item { Layout.fillWidth: true }
+            Label { text: "Seed (-1 = random)" }
+            SpinBox { id: seed; objectName: "generationSeed"; from: -1; to: 999999999; value: 42; editable: true }
             Label { text: "Radius" }
             SpinBox { id: targetRadius; from: 4; to: 100; value: 28; editable: true }
             Button {
+                objectName: "generateButton"
                 text: "Generate"
                 enabled: modelChoice.currentIndex >= 0 && page.generatorController.models.length > 0
                 onClicked: page.generatorController.generate(
@@ -70,6 +121,7 @@ Item {
         }
         RowLayout {
             Layout.fillWidth: true
+            Layout.minimumWidth: 0
             Label { text: "Start X" }
             SpinBox { id: startX; from: -10000; to: 10000; value: 120; editable: true }
             Label { text: "Y" }
@@ -82,6 +134,7 @@ Item {
         Label { text: page.generatorController.message; wrapMode: Text.Wrap; Layout.fillWidth: true; color: "#4b5563" }
         RowLayout {
             Layout.fillWidth: true
+            Layout.minimumWidth: 0
             Label {
                 text: "Playback: " + appController.playbackController.state
                 color: appController.playbackController.state === "armed" ? "#b45309" : appController.playbackController.state === "playing" ? "#b91c1c" : "#4b5563"
@@ -106,11 +159,13 @@ Item {
         }
         Label {
             visible: modelChoice.currentIndex >= 0 && modelChoice.model[modelChoice.currentIndex].validation_summary !== undefined
-            text: modelChoice.currentIndex < 0 ? "" : modelChoice.model[modelChoice.currentIndex].validation_summary
+            text: modelChoice.currentIndex < 0 || modelChoice.model[modelChoice.currentIndex].validation_summary === undefined ?
+                      "" : modelChoice.model[modelChoice.currentIndex].validation_summary
             color: "#047857"
         }
         RowLayout {
             Layout.fillWidth: true
+            Layout.minimumWidth: 0
             Label { text: "Trajectory viewport"; font.bold: true }
             Label {
                 text: {
@@ -119,8 +174,10 @@ Item {
                            Number(desktop.width).toFixed(0) + " x " + Number(desktop.height).toFixed(0) + " desktop"
                 }
                 color: "#4b5563"
+                Layout.fillWidth: true
+                Layout.minimumWidth: 0
+                elide: Text.ElideRight
             }
-            Item { Layout.fillWidth: true }
             Label { text: "Zoom" }
             Slider {
                 id: zoomSlider
@@ -131,6 +188,7 @@ Item {
             }
             Label { text: Math.round(zoomSlider.value * 100) + "%"; Layout.preferredWidth: 45 }
             Button {
+                objectName: "fitTrajectoryButton"
                 text: "Fit"
                 onClicked: {
                     zoomSlider.value = 1
@@ -142,7 +200,7 @@ Item {
             id: preview
             Layout.fillWidth: true
             Layout.fillHeight: true
-            Layout.minimumHeight: 250
+            Layout.minimumHeight: 80
             color: "#030712"; radius: 6; border.color: "#374151"
             clip: true
             readonly property var trajectory: page.generatorController.trajectory
@@ -269,6 +327,7 @@ Item {
                                 return Number(data.duration_ms).toFixed(1) + " ms - path " + Number(data.path_length).toFixed(1) +
                                        " px - peak " + Number(data.peak_speed).toFixed(0) + " px/s - distance score " +
                                        Number(data.condition_distance).toFixed(2) + " - seed " + data.seed
+                                       + (data.source_index === undefined || data.source_index < 0 ? "" : " - source sample " + data.source_index)
                                        + " - " + data.condition_class.split("_").join(" ")
                             }
                         }

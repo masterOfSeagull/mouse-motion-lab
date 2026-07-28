@@ -24,7 +24,7 @@ struct Runtime {
     std::unique_ptr<Ort::Session> session;
     std::vector<double> condition_mean, condition_scale, training_conditions, output_mean, output_scale;
     std::size_t condition_size{}, output_size{}, training_count{};
-    std::uint32_t solver_steps{16}; bool heun{true}; std::string error;
+    std::uint32_t solver_steps{16}; bool heun{true}, zero_condition{false}; std::string error;
 };
 template<class T> void read_exact(std::ifstream& in, T* data, std::size_t count) {
     in.read(reinterpret_cast<char*>(data), static_cast<std::streamsize>(sizeof(T) * count));
@@ -84,7 +84,7 @@ extern "C" MGResult mg_create(const char* directory, MGHandle* output) {
         if(std::memcmp(magic,"MMLNORM1",8)!=0||c!=21||o!=129||n==0) throw std::runtime_error("unsupported normalization artifact");
         r->condition_size=c;r->output_size=o;r->training_count=n; r->condition_mean.resize(c);r->condition_scale.resize(c);r->training_conditions.resize(static_cast<std::size_t>(c)*n);r->output_mean.resize(o);r->output_scale.resize(o);
         read_exact(in,r->condition_mean.data(),c);read_exact(in,r->condition_scale.data(),c);read_exact(in,r->training_conditions.data(),static_cast<std::size_t>(c)*n);read_exact(in,r->output_mean.data(),o);read_exact(in,r->output_scale.data(),o);
-        std::smatch match; if(std::regex_search(manifest,match,std::regex("\"solver_steps\":([0-9]+)"))) r->solver_steps=static_cast<std::uint32_t>(std::stoul(match[1])); r->heun=manifest.find("\"solver\":\"heun\"")!=std::string::npos;
+        std::smatch match; if(std::regex_search(manifest,match,std::regex("\"solver_steps\":([0-9]+)"))) r->solver_steps=static_cast<std::uint32_t>(std::stoul(match[1])); r->heun=manifest.find("\"solver\":\"heun\"")!=std::string::npos; r->zero_condition=manifest.find("\"condition_mode\":\"zero\"")!=std::string::npos;
         r->options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL); r->options.SetIntraOpNumThreads(1); r->session=std::make_unique<Ort::Session>(r->env,(root/"velocity.onnx").c_str(),r->options);
         *output=r.release();global_error.clear();return MG_OK;
     } catch(const std::exception& e){set_error(nullptr,e.what());return MG_RUNTIME_ERROR;}
@@ -93,7 +93,7 @@ extern "C" MGResult mg_generate(MGHandle handle,const MGGenerationRequest* q,MGT
     auto* r=static_cast<Runtime*>(handle); if(!r||!q||!out){set_error(r,"handle, request, and trajectory are required");return MG_INVALID_ARGUMENT;}
     try {
         if(!(q->target_radius>0&&q->virtual_desktop_width>0&&q->virtual_desktop_height>0&&q->dpi_scale>0)) throw std::invalid_argument("request dimensions must be positive");
-        auto raw=condition(*q);std::vector<float> cond(r->condition_size);for(std::size_t i=0;i<cond.size();++i)cond[i]=static_cast<float>((raw[i]-r->condition_mean[i])/r->condition_scale[i]);
+        auto raw=condition(*q);std::vector<float> cond(r->condition_size);for(std::size_t i=0;i<cond.size();++i)cond[i]=r->zero_condition?0.0f:static_cast<float>((raw[i]-r->condition_mean[i])/r->condition_scale[i]);
         double nearest=std::numeric_limits<double>::infinity();for(std::size_t row=0;row<r->training_count;++row){double sum=0;for(std::size_t i=0;i<r->condition_size;++i){const auto d=cond[i]-r->training_conditions[row*r->condition_size+i];sum+=d*d;}nearest=std::min(nearest,std::sqrt(sum));}
         auto state=normal_source(q->random_seed,r->output_size);const auto steps=q->solver_steps?q->solver_steps:r->solver_steps;const float dt=1.0f/steps;
         for(std::uint32_t i=0;i<steps;++i){auto v=velocity(*r,state,cond,i*dt);if(r->heun){auto predicted=state;for(std::size_t j=0;j<state.size();++j)predicted[j]+=dt*v[j];auto next=velocity(*r,predicted,cond,(i+1)*dt);for(std::size_t j=0;j<state.size();++j)state[j]+=dt*(v[j]+next[j])/2;}else for(std::size_t j=0;j<state.size();++j)state[j]+=dt*v[j];}

@@ -105,4 +105,100 @@ def train_conditional_flow(
         conn.close()
 
 
-__all__ = ["train_conditional_flow"]
+def train_experimental_conditional_flow(
+    root: Path, database: Path, preprocessing_run_id: str, config: ConditionalFlowConfig,
+    progress: Callable[[int, dict[str, float]], None] | None = None,
+    name: str | None = None,
+) -> dict[str, Any]:
+    """Train all processed rows with zero conditions and publish without a validation claim."""
+    if (config.training_scope, config.validation_mode, config.condition_mode) != ("all", "none", "zero"):
+        raise ValueError("experimental flow requires all training rows, no validation, and zero conditions")
+    dataset = load_processed_dataset(root, database, preprocessing_run_id)
+    revision = current_code_revision()
+    resolved = dict(config.__dict__)
+    conn = connect(database)
+    experiment_id = model_id = ""
+    model_dir: Path | None = None
+    try:
+        migrate(conn)
+        repos = Repositories(conn)
+        if config.source_mode == "training_sample":
+            source_label = f"Training-Sample Source {config.source_vertical_scale:g}x Vertical"
+        else:
+            source_label = "Gaussian Source"
+        display_name = name or f"Experimental Zero-Condition {source_label} Flow {preprocessing_run_id[:8]}"
+        experiment_id = repos.create_experiment(
+            display_name, dataset.snapshot_id, preprocessing_run_id, resolved, config.seed,
+        )
+        repos.start_experiment(experiment_id)
+        model_id = repos.create_flow_model_draft(
+            display_name, dataset.snapshot_id, preprocessing_run_id, resolved, revision,
+        )
+        checkpoint_dir = root / "experiments" / experiment_id / "checkpoints"
+
+        def on_epoch(epoch: int, metrics: dict[str, float]) -> None:
+            checkpoint = checkpoint_dir / f"epoch-{epoch:04d}.pt"
+            relative = checkpoint.relative_to(root).as_posix() if checkpoint.is_file() else None
+            repos.update_experiment_metrics(experiment_id, epoch, metrics, relative)
+            if progress:
+                progress(epoch, metrics)
+
+        generator = ConditionalFlowGenerator(config).fit(dataset, on_epoch, checkpoint_dir)
+        final_checkpoint = checkpoint_dir / f"epoch-{config.epochs:04d}.pt"
+        if final_checkpoint.is_file() and generator.history:
+            repos.update_experiment_metrics(
+                experiment_id, config.epochs, generator.history[-1], final_checkpoint.relative_to(root).as_posix(),
+            )
+        model_dir = root / "models" / model_id
+        generator.save(model_dir)
+        training_report = {
+            "schema_version": 1,
+            "model_id": model_id,
+            "experiment_id": experiment_id,
+            "training_sample_count": len(dataset.outputs),
+            "training_scope": "all_snapshot_rows",
+            "condition_mode": "zero",
+            "source_mode": config.source_mode,
+            "source_vertical_scale": config.source_vertical_scale,
+            "validation_status": "skipped_by_request",
+            "final_training_loss": generator.history[-1]["training_loss"],
+        }
+        training_report_path = model_dir / "training-report.json"
+        _write_json(training_report_path, training_report)
+        manifest_path = model_dir / "model.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest.update({
+            "model_id": model_id, "experiment_id": experiment_id, "dataset_snapshot_id": dataset.snapshot_id,
+            "preprocessing_run_id": preprocessing_run_id, "code_revision": revision, "training_seed": config.seed,
+            "training_sample_count": len(dataset.outputs), "validation_status": "skipped_by_request",
+            "training_report_sha256": _digest(training_report_path),
+            "environment": {"python": sys.version.split()[0], "platform": platform.platform(), "numpy": np.__version__},
+        })
+        _write_json(manifest_path, manifest)
+        repos.finalize_candidate_model(
+            model_id, manifest_path.relative_to(root).as_posix(), _digest(manifest_path),
+        )
+        repos.complete_experiment(experiment_id, model_id)
+        return {
+            "experiment_id": experiment_id, "model_id": model_id, "training_report": training_report,
+            "history": generator.history,
+        }
+    except Exception as exc:
+        if experiment_id:
+            try:
+                Repositories(conn).fail_experiment(experiment_id, str(exc))
+            except Exception:
+                pass
+        if model_id:
+            try:
+                Repositories(conn).discard_baseline_model_draft(model_id, str(exc))
+            except Exception:
+                pass
+        if model_dir is not None and model_dir.is_dir():
+            shutil.rmtree(model_dir, ignore_errors=True)
+        raise
+    finally:
+        conn.close()
+
+
+__all__ = ["train_conditional_flow", "train_experimental_conditional_flow"]

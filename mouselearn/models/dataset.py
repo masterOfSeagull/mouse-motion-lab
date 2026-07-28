@@ -44,7 +44,7 @@ def load_processed_dataset(root: Path, database: Path, preprocessing_run_id: str
     try:
         migrate(conn)
         run = conn.execute(
-            """SELECT r.status,d.snapshot_id,d.processed_relative_path,d.processed_sha256
+            """SELECT r.status,d.snapshot_id,d.config_json,d.processed_relative_path,d.processed_sha256
                  FROM preprocessing_runs r JOIN preprocessing_run_details d ON d.run_id=r.id
                  WHERE r.id=?""", (preprocessing_run_id,),
         ).fetchone()
@@ -76,6 +76,8 @@ def load_processed_dataset(root: Path, database: Path, preprocessing_run_id: str
     table = pq.read_table(processed_path)
     records = table.to_pylist()
     conditions, outputs, requests, splits, trial_ids = [], [], [], [], []
+    preprocessing_config = json.loads(run["config_json"] or "{}")
+    expected_position_count = preprocessing_config.get("equal_time_position_count")
     for record in records:
         trial_id = str(record["trial_id"])
         row = metadata.get(trial_id)
@@ -89,8 +91,12 @@ def load_processed_dataset(root: Path, database: Path, preprocessing_run_id: str
                 json.loads(row["environment_json"]),
             )
             canonical = np.asarray(record["canonical_positions"], dtype=np.float64)
-            if canonical.shape != (64, 2):
+            if canonical.ndim != 2 or canonical.shape[1] != 2 or canonical.shape[0] < 2:
                 raise ProcessedDatasetError(f"processed trial has the wrong position shape: {trial_id}")
+            if expected_position_count is None:
+                expected_position_count = int(canonical.shape[0])
+            if canonical.shape != (int(expected_position_count), 2):
+                raise ProcessedDatasetError(f"processed trial position count does not match its preprocessing run: {trial_id}")
             output = np.concatenate((canonical.reshape(-1), [float(record["log_total_movement_duration"])]))
         except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
             raise ProcessedDatasetError(f"invalid processed metadata for trial {trial_id}: {exc}") from exc
